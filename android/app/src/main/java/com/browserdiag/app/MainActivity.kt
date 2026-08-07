@@ -744,8 +744,8 @@ class MainActivity : AppCompatActivity() {
             "(function(){var out=[];document.querySelectorAll('video,audio').forEach(function(m){if(m.src)out.push(m.src);m.querySelectorAll('source').forEach(function(s){if(s.src)out.push(s.src);});});if(window.__bdNet)window.__bdNet.forEach(function(n){if(/\\.(mp4|m3u8|mp3|webm|flv|m4a|ogg|aac)(\\?|$)/i.test(n.url))out.push(n.url);});return JSON.stringify(out);})()"
         ) { raw ->
             val list = try {
-                val v = org.json.JSONTokener(raw ?: "[]").nextValue()
-                (v as? JSONArray)?.let { arr -> (0 until arr.length()).map { arr.getString(it) } } ?: emptyList()
+                val arr = decodeJsArray(raw)
+                (0 until arr.length()).map { arr.getString(it) }
             } catch (e: Exception) {
                 emptyList()
             }
@@ -767,8 +767,8 @@ class MainActivity : AppCompatActivity() {
             "(function(){var out=[];document.querySelectorAll('img[src],script[src],link[href]').forEach(function(e){var u=e.src||e.href;if(u&&u.indexOf('data:')!==0)out.push(u);});return JSON.stringify(out.slice(0,60));})()"
         ) { raw ->
             val list = try {
-                val v = org.json.JSONTokener(raw ?: "[]").nextValue()
-                (v as? JSONArray)?.let { arr -> (0 until arr.length()).map { arr.getString(it) } } ?: emptyList()
+                val arr = decodeJsArray(raw)
+                (0 until arr.length()).map { arr.getString(it) }
             } catch (e: Exception) {
                 emptyList()
             }
@@ -1118,12 +1118,7 @@ class MainActivity : AppCompatActivity() {
             }
             val consoleJson = synchronized(consoleLogs) { JSONArray(consoleLogs.toList()).toString() }
             wv.evaluateJavascript("JSON.stringify(window.__bdNet||[])") { netRaw ->
-                val netJson = try {
-                    val v = org.json.JSONTokener(netRaw ?: "[]").nextValue()
-                    v as? String ?: "[]"
-                } catch (e: Exception) {
-                    "[]"
-                }
+                val netJson = decodeJsArray(netRaw).toString()
                 SourcePacker.pack(
                     context = this,
                     url = currentUrl,
@@ -1203,7 +1198,7 @@ class MainActivity : AppCompatActivity() {
     private fun showNetLog() {
         val wv = currentWeb() ?: return toast("无页面")
         wv.evaluateJavascript("JSON.stringify((window.__bdNet||[]).slice(-100).reverse())") { raw ->
-            val arr = try { JSONArray(raw) } catch (e: Exception) { JSONArray() }
+            val arr = decodeJsArray(raw)
             if (arr.length() == 0) { toast("暂无网络请求记录"); return@evaluateJavascript }
             val lines = (0 until arr.length()).map { i ->
                 val o = arr.optJSONObject(i)
@@ -1218,7 +1213,21 @@ class MainActivity : AppCompatActivity() {
                     copyText(o.optString("url"))
                 }
                 .setNegativeButton("关闭", null)
-                .show()
+            .show()
+        }
+    }
+
+    /** WebView 会把 JavaScript 字符串结果再编码一层；兼容 JSON.stringify(...) 的双层返回值。 */
+    private fun decodeJsArray(raw: String?): JSONArray {
+        if (raw.isNullOrBlank() || raw == "null" || raw == "undefined") return JSONArray()
+        return try {
+            when (val first = org.json.JSONTokener(raw).nextValue()) {
+                is JSONArray -> first
+                is String -> runCatching { JSONArray(first) }.getOrDefault(JSONArray())
+                else -> JSONArray()
+            }
+        } catch (_: Exception) {
+            JSONArray()
         }
     }
 
