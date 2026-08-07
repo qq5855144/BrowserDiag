@@ -484,6 +484,53 @@ class BrowserDiag {
     }
     return { closed: true };
   }
+
+  // ==================== v3.1 新增（参考 mcp-chrome） ====================
+
+  /** 提取页面正文文本（mcp-chrome: chrome_get_web_content） */
+  async text({ maxLen = 20000 } = {}) {
+    const page = await this._ensurePage();
+    const r = await page.evaluate((ml) => {
+      const a = document.querySelector('article') || document.body;
+      const t = (a ? a.innerText : '').replace(/\n{3,}/g, '\n\n');
+      return { title: document.title, url: location.href, text: t.slice(0, ml), length: t.length };
+    }, maxLen).catch((e) => ({ evalErr: String(e) }));
+    return r;
+  }
+
+  /** 查找可点击元素（mcp-chrome: chrome_get_interactive_elements） */
+  async interactive({ limit = 50 } = {}) {
+    const page = await this._ensurePage();
+    const r = await page.evaluate((lim) => {
+      const els = Array.from(document.querySelectorAll('a[href],button,input,select,textarea,[role=button],[onclick],[tabindex]'))
+        .filter((e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; })
+        .slice(0, lim);
+      function sel(n) {
+        if (!n || n === document.body) return '';
+        if (n.id) return '#' + n.id;
+        const p = n.parentElement;
+        const s = p ? Array.from(p.children).indexOf(n) + 1 : 1;
+        return sel(p) + '>' + n.tagName.toLowerCase() + ':nth-child(' + s + ')';
+      }
+      return els.map((e) => ({
+        tag: e.tagName.toLowerCase(),
+        text: (e.innerText || e.value || e.getAttribute('aria-label') || '').trim().slice(0, 80),
+        href: e.getAttribute('href') || '',
+        type: e.getAttribute('type') || '',
+        selector: sel(e).slice(0, 200),
+      }));
+    }, limit).catch((e) => ({ evalErr: String(e) }));
+    return { count: Array.isArray(r) ? r.length : 0, elements: Array.isArray(r) ? r : [] };
+  }
+
+  /** 自定义 HTTP GET 请求（mcp-chrome: chrome_network_request） */
+  async http({ url, headers = '', timeoutMs = 10000 }) {
+    const page = await this._ensurePage();
+    const h = headers ? JSON.parse(headers) : {};
+    const res = await page.request.get(url, { headers: h, timeout: timeoutMs });
+    const body = await res.text();
+    return { status: res.status(), url, bodyLength: body.length, body: body.slice(0, 50000), headers: res.headers() };
+  }
 }
 
 const diag = new BrowserDiag();
@@ -608,6 +655,21 @@ const toolDefs = {
     desc: '请求拦截：patterns 匹配的请求返回 mock（空数组取消拦截）',
     schema: { patterns: z.array(z.string()), mock: z.string().optional(), status: z.number().optional() },
     run: (p) => diag.route(p),
+  },
+  browser_text: {
+    desc: '提取页面正文文本（mcp-chrome: chrome_get_web_content）',
+    schema: { maxLen: z.number().optional() },
+    run: (p) => diag.text(p),
+  },
+  browser_interactive: {
+    desc: '查找可点击元素及 CSS 选择器（mcp-chrome: chrome_get_interactive_elements）',
+    schema: { limit: z.number().optional() },
+    run: (p) => diag.interactive(p),
+  },
+  browser_http: {
+    desc: '自定义 HTTP GET 请求，返回状态码/响应头/正文（mcp-chrome: chrome_network_request）',
+    schema: { url: z.string(), headers: z.string().optional(), timeoutMs: z.number().optional() },
+    run: (p) => diag.http(p),
   },
 };
 

@@ -3,11 +3,14 @@ package com.browserdiag.app
 import android.annotation.SuppressLint
 import android.app.AlertDialog
 import android.app.DownloadManager
+import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ActivityInfo
+import android.database.Cursor
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.Uri
@@ -20,10 +23,13 @@ import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
 import android.webkit.ConsoleMessage
 import android.webkit.DownloadListener
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -321,6 +327,7 @@ class MainActivity : AppCompatActivity() {
             displayZoomControls = false
             cacheMode = WebSettings.LOAD_DEFAULT
             userAgentString = settings.uaMode.uaString(WebSettings.getDefaultUserAgent(this@MainActivity))
+            textZoom = settings.fontScale
         }
 
         // 网络 hook + 油猴脚本（document-start）
@@ -393,6 +400,19 @@ class MainActivity : AppCompatActivity() {
                 }
                 runOnUiThread { statusBar.text = buildStatusText() }
             }
+
+            // 广告拦截：命中规则则返回空响应
+            override fun shouldInterceptRequest(
+                view: WebView?, request: WebResourceRequest?
+            ): WebResourceResponse? {
+                if (settings.adBlock && request?.url != null) {
+                    val host = request.url.host?.lowercase() ?: ""
+                    if (host.isNotEmpty() && AD_BLOCK_HOSTS.any { host == it || host.endsWith(".$it") }) {
+                        return WebResourceResponse("text/plain", "utf-8", java.io.ByteArrayInputStream(ByteArray(0)))
+                    }
+                }
+                return super.shouldInterceptRequest(view, request)
+            }
         }
 
         wv.setDownloadListener(DownloadListener { url, _, _, mimeType, _ ->
@@ -454,36 +474,48 @@ class MainActivity : AppCompatActivity() {
 
     // ==================== 主菜单（分组 + 矢量图标） ====================
     private fun showMainMenu() {
+        val menuCfg = settings.getMenuConfig()
+        fun enabled(id: String) = menuCfg[id] != false
         val groups = listOf(
             Pair("📌 页面", listOf(
-                MenuItem(R.drawable.ic_bookmark, "书签") { showBookmarks() },
-                MenuItem(R.drawable.ic_save, "保存页面") { savePage() },
-                MenuItem(R.drawable.ic_share, "分享") { sharePage() },
-                MenuItem(R.drawable.ic_find, "页面查找") { showFindBar() },
-                MenuItem(R.drawable.ic_translate, "翻译本页") { translatePage() },
-                MenuItem(R.drawable.ic_widget, "添加到桌面") { addToHome() }
+                MenuItem("bookmark", R.drawable.ic_bookmark, "书签") { showBookmarks() },
+                MenuItem("save", R.drawable.ic_save, "保存页面") { savePage() },
+                MenuItem("share", R.drawable.ic_share, "分享") { sharePage() },
+                MenuItem("find", R.drawable.ic_find, "页面查找") { showFindBar() },
+                MenuItem("translate", R.drawable.ic_translate, "翻译本页") { translatePage() },
+                MenuItem("widget", R.drawable.ic_widget, "添加到桌面") { addToHome() },
+                MenuItem("fullscreen", R.drawable.ic_launch, "全屏模式") { toggleFullscreen() }
             )),
             Pair("🌐 工具", listOf(
-                MenuItem(R.drawable.ic_movie, "嗅探媒体资源") { sniffMedia() },
-                MenuItem(R.drawable.ic_folder, "查看页面资源") { pageResources() },
-                MenuItem(R.drawable.ic_code, "页面源码 (zip)") { downloadSourceZip() },
-                MenuItem(R.drawable.ic_qr, "生成二维码") { showQr() },
-                MenuItem(R.drawable.ic_mic, "语音播报") { speakPage() },
-                MenuItem(R.drawable.ic_tools, "开发者工具") { devTools() }
+                MenuItem("sniff", R.drawable.ic_movie, "嗅探媒体资源") { sniffMedia() },
+                MenuItem("resources", R.drawable.ic_folder, "查看页面资源") { pageResources() },
+                MenuItem("source", R.drawable.ic_code, "页面源码 (zip)") { downloadSourceZip() },
+                MenuItem("qr", R.drawable.ic_qr, "生成二维码") { showQr() },
+                MenuItem("tts", R.drawable.ic_mic, "语音播报") { speakPage() },
+                MenuItem("netlog", R.drawable.ic_download, "网络日志") { showNetLog() },
+                MenuItem("downloads", R.drawable.ic_arrow, "下载管理") { showDownloads() },
+                MenuItem("devtools", R.drawable.ic_tools, "开发者工具") { devTools() }
             )),
             Pair("⚙️ 设置", listOf(
-                MenuItem(R.drawable.ic_dark, "深色主题：${if (isDark) "开" else "关"}") { toggleDark() },
-                MenuItem(R.drawable.ic_search, "搜索引擎：${settings.engine.label}") { showEnginePicker() },
-                MenuItem(R.drawable.ic_phone, "UA：${settings.uaMode.label}") { showUaPicker() },
-                MenuItem(R.drawable.ic_extension, "油猴脚本") { showScriptManager() },
-                MenuItem(R.drawable.ic_history, "历史记录") { showHistory() },
-                MenuItem(R.drawable.ic_info, "关于 / API") { showAbout() }
+                MenuItem("dark", R.drawable.ic_dark, "深色主题：${if (isDark) "开" else "关"}") { toggleDark() },
+                MenuItem("engine", R.drawable.ic_search, "搜索引擎：${settings.engine.label}") { showEnginePicker() },
+                MenuItem("ua", R.drawable.ic_phone, "UA：${settings.uaMode.label}") { showUaPicker() },
+                MenuItem("userscript", R.drawable.ic_extension, "油猴脚本") { showScriptManager() },
+                MenuItem("font", R.drawable.ic_find, "字体大小：${settings.fontScale}%") { showFontScale() },
+                MenuItem("orientation", R.drawable.ic_refresh, "屏幕方向：${orientationLabel()}") { showOrientation() },
+                MenuItem("adblock", R.drawable.ic_close, "广告拦截：${if (settings.adBlock) "开" else "关"}") { toggleAdBlock() },
+                MenuItem("debugweb", R.drawable.ic_code, "允许调试网页：${if (settings.debugWeb) "开" else "关"}") { toggleDebugWeb() },
+                MenuItem("menuconfig", R.drawable.ic_menu, "定制菜单") { showMenuConfig() },
+                MenuItem("history", R.drawable.ic_history, "历史记录") { showHistory() },
+                MenuItem("about", R.drawable.ic_info, "关于 / API") { showAbout() }
             ))
         )
+        val filtered = groups.map { (title, items) -> title to items.filter { enabled(it.id) } }
+            .filter { it.second.isNotEmpty() }
 
         val scroll = ScrollView(this)
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        for ((groupTitle, items) in groups) {
+        for ((groupTitle, items) in filtered) {
             col.addView(TextView(this).apply {
                 text = groupTitle
                 textSize = 13f
@@ -505,7 +537,7 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    private class MenuItem(val icon: Int, val label: String, val action: () -> Unit)
+    private class MenuItem(val id: String, val icon: Int, val label: String, val action: () -> Unit)
 
     private fun menuRow(iconRes: Int, label: String, action: () -> Unit): LinearLayout =
         LinearLayout(this).apply {
@@ -1065,6 +1097,195 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+        // ==================== v3.1 新功能（参考 X 浏览器） ====================
+
+    /** 全屏模式：隐藏顶栏/状态栏/底栏，沉浸式浏览 */
+    private fun toggleFullscreen() {
+        val isFullscreen = bottomBar.visibility != View.VISIBLE
+        if (isFullscreen) {
+            // 退出全屏
+            topBar.visibility = View.VISIBLE
+            bottomBar.visibility = View.VISIBLE
+            statusBar.visibility = View.VISIBLE
+            window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
+            toast("已退出全屏")
+        } else {
+            // 进入全屏
+            topBar.visibility = View.GONE
+            bottomBar.visibility = View.GONE
+            statusBar.visibility = View.GONE
+            window.decorView.systemUiVisibility =
+                View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+            toast("全屏模式（再点菜单可退出）")
+        }
+    }
+
+    /** 网络日志面板：读取 window.__bdNet 展示请求列表 */
+    private fun showNetLog() {
+        val wv = currentWeb() ?: return toast("无页面")
+        wv.evaluateJavascript("JSON.stringify((window.__bdNet||[]).slice(-100).reverse())") { raw ->
+            val arr = try { JSONArray(raw) } catch (e: Exception) { JSONArray() }
+            if (arr.length() == 0) { toast("暂无网络请求记录"); return@evaluateJavascript }
+            val lines = (0 until arr.length()).map { i ->
+                val o = arr.optJSONObject(i)
+                val status = o.optInt("status")
+                val color = if (status in 200..399) "🟢" else if (status == 0) "🔴" else "🟡"
+                "$color ${o.optString("method")} $status  ${o.optString("url")}"
+            }
+            AlertDialog.Builder(this)
+                .setTitle("网络日志（${arr.length()} 条）")
+                .setItems(lines.toTypedArray()) { _, idx ->
+                    val o = arr.optJSONObject(idx)
+                    copyText(o.optString("url"))
+                }
+                .setNegativeButton("关闭", null)
+                .show()
+        }
+    }
+
+    /** 下载管理：列出系统 DownloadManager 的下载记录，点击打开 */
+    private fun showDownloads() {
+        val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+        val q = DownloadManager.Query()
+        q.setFilterByStatus(DownloadManager.STATUS_SUCCESSFUL or DownloadManager.STATUS_PAUSED or DownloadManager.STATUS_RUNNING or DownloadManager.STATUS_PENDING)
+        val cursor: Cursor? = try { dm.query(q) } catch (e: Exception) { null }
+        if (cursor == null || !cursor.moveToFirst()) {
+            cursor?.close()
+            toast("暂无下载记录")
+            return
+        }
+        val names = mutableListOf<String>()
+        val uris = mutableListOf<Uri>()
+        do {
+            val title = cursor.getString(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_TITLE))
+            val uri = cursor.getString(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_LOCAL_URI))
+            val size = cursor.getLong(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES))
+            names.add("$title  (${size / 1024}KB)")
+            uris.add(Uri.parse(uri ?: ""))
+        } while (cursor.moveToNext())
+        cursor.close()
+        AlertDialog.Builder(this)
+            .setTitle("下载管理（${names.size} 个）")
+            .setItems(names.toTypedArray()) { _, idx ->
+                try {
+                    startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uris[idx], "*/*").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+                } catch (e: ActivityNotFoundException) {
+                    toast("无法打开该文件")
+                }
+            }
+            .setNegativeButton("关闭", null)
+            .show()
+    }
+
+    /** 广告拦截开关：持久化 + 刷新当前页生效 */
+    private fun toggleAdBlock() {
+        settings.adBlock = !settings.adBlock
+        val on = settings.adBlock
+        toast(if (on) "广告拦截已开启" else "广告拦截已关闭")
+        currentWeb()?.reload()
+    }
+
+    /** 允许调试网页（WebView 远程调试，chrome://inspect 可见） */
+    private fun toggleDebugWeb() {
+        settings.debugWeb = !settings.debugWeb
+        WebView.setWebContentsDebuggingEnabled(settings.debugWeb)
+        toast(if (settings.debugWeb) "已开启 WebView 远程调试（chrome://inspect 可连接）" else "已关闭远程调试")
+    }
+
+    /** 字体大小调节（50%-200%，textZoom 持久化） */
+    private fun showFontScale() {
+        val options = arrayOf("50%", "75%", "100%", "125%", "150%", "175%", "200%")
+        val values = intArrayOf(50, 75, 100, 125, 150, 175, 200)
+        val current = settings.fontScale
+        val checked = values.indexOfFirst { it == current }.coerceAtLeast(0)
+        AlertDialog.Builder(this)
+            .setTitle("字体大小（当前 ${current}%）")
+            .setSingleChoiceItems(options, checked) { _, which ->
+                settings.fontScale = values[which]
+                tabs.all.forEach { it.webView.settings.textZoom = values[which] }
+                toast("字体已调整为 ${values[which]}%")
+            }
+            .setNegativeButton("关闭", null)
+            .show()
+    }
+
+    private fun orientationLabel(): String = when (settings.screenOrientation) {
+        "portrait" -> "竖屏"
+        "landscape" -> "横屏"
+        else -> "自动"
+    }
+
+    /** 屏幕方向：自动 / 竖屏 / 横屏 */
+    private fun showOrientation() {
+        val options = arrayOf("自动旋转", "竖屏锁定", "横屏锁定")
+        val checked = when (settings.screenOrientation) {
+            "portrait" -> 1
+            "landscape" -> 2
+            else -> 0
+        }
+        AlertDialog.Builder(this)
+            .setTitle("屏幕方向")
+            .setSingleChoiceItems(options, checked) { _, which ->
+                settings.screenOrientation = when (which) {
+                    1 -> "portrait"; 2 -> "landscape"; else -> "auto"
+                }
+                requestedOrientation = when (which) {
+                    1 -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                    2 -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                    else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                }
+                toast("屏幕方向：${options[which]}")
+            }
+            .setNegativeButton("关闭", null)
+            .show()
+    }
+
+    /** 定制菜单：菜单项显隐开关（持久化） */
+    private fun showMenuConfig() {
+        val allItems = listOf(
+            "bookmark" to "书签", "save" to "保存页面", "share" to "分享", "find" to "页面查找",
+            "translate" to "翻译本页", "widget" to "添加到桌面", "fullscreen" to "全屏模式",
+            "sniff" to "嗅探媒体资源", "resources" to "查看页面资源", "source" to "页面源码zip",
+            "qr" to "生成二维码", "tts" to "语音播报", "netlog" to "网络日志", "downloads" to "下载管理",
+            "devtools" to "开发者工具", "dark" to "深色主题", "engine" to "搜索引擎",
+            "ua" to "UA 切换", "userscript" to "油猴脚本", "font" to "字体大小",
+            "orientation" to "屏幕方向", "adblock" to "广告拦截", "debugweb" to "允许调试网页",
+            "menuconfig" to "定制菜单", "history" to "历史记录", "about" to "关于"
+        )
+        val cfg = settings.getMenuConfig().toMutableMap()
+        val scroll = ScrollView(this)
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        allItems.forEachIndexed { i, (id, label) ->
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(24, 6, 24, 6)
+            }
+            val cb = android.widget.CheckBox(this).apply {
+                text = label
+                textSize = 15f
+                isChecked = cfg[id] != false
+                setOnCheckedChangeListener { _, isChecked -> cfg[id] = isChecked }
+            }
+            row.addView(cb)
+            col.addView(row)
+        }
+        scroll.addView(col)
+        AlertDialog.Builder(this)
+            .setTitle("定制菜单（勾选显示）")
+            .setView(scroll)
+            .setPositiveButton("保存") { _, _ -> settings.setMenuConfig(cfg); toast("菜单已更新") }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun copyText(text: String) {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("browserdiag", text))
+        toast("已复制")
+    }
+
     private fun startServer() {
         var port = 8788
         var started = false
@@ -1074,7 +1295,9 @@ class MainActivity : AppCompatActivity() {
                     port,
                     applicationContext,
                     { tabs.current?.webView },
-                    { synchronized(consoleLogs) { consoleLogs.toList() } }
+                    { synchronized(consoleLogs) { consoleLogs.toList() } },
+                    { settings },
+                    { tabs }
                 )
                 s.start(500, true)
                 server = s
@@ -1125,6 +1348,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     companion object {
+        /** 广告拦截域名黑名单（子域名自动匹配） */
+        private val AD_BLOCK_HOSTS = listOf(
+            "doubleclick.net", "googlesyndication.com", "googleadservices.com",
+            "adservice.google.com", "adnxs.com", "adsystem.com", "criteo.com",
+            "taboola.com", "outbrain.com", "amazon-adsystem.com", "pubmatic.com",
+            "rubiconproject.com", "moatads.com", "scorecardresearch.com",
+            "advertising.com", "adsrvr.org", "quantserve.com", "lijit.com",
+            "openx.net", "casalemedia.com", "smartadserver.com", "adroll.com",
+            "revcontent.com", "popads.net", "propellerads.com", "adsterra.com"
+        )
+
         private val NETWORK_HOOK_JS = """
             (function(){
               if (window.__bdHooked) return;

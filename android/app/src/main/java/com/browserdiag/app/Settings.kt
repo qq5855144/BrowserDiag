@@ -182,4 +182,44 @@ class Settings(private val ctx: Context) {
     }
 
     fun clearHistory() = prefs.edit().remove("history").apply()
+
+    // ---------- 广告拦截 ----------
+    var adBlock: Boolean
+        get() = prefs.getBoolean("adblock", false)
+        set(v) = prefs.edit().putBoolean("adblock", v).apply()
+
+    // ---------- 字体缩放（%） ----------
+    var fontScale: Int
+        get() = prefs.getInt("font_scale", 100)
+        set(v) = prefs.edit().putInt("font_scale", v.coerceIn(50, 200)).apply()
+
+    // ---------- 屏幕方向（auto/portrait/landscape） ----------
+    var screenOrientation: String
+        get() = prefs.getString("screen_orientation", "auto") ?: "auto"
+        set(v) = prefs.edit().putString("screen_orientation", v).apply()
+
+    // ---------- 允许调试网页（WebView 远程调试） ----------
+    var debugWeb: Boolean
+        get() = prefs.getBoolean("debug_web", false)
+        set(v) = prefs.edit().putBoolean("debug_web", v).apply()
+
+    // ---------- 定制菜单（菜单项显隐） ----------
+    fun getMenuConfig(): Map<String, Boolean> {
+        val raw = prefs.getString("menu_config", null) ?: return emptyMap()
+        return try {
+            val arr = JSONArray(raw)
+            (0 until arr.length()).associate { i ->
+                val o = arr.getJSONObject(i)
+                o.optString("id") to o.optBoolean("enabled", true)
+            }
+        } catch (e: Exception) {
+            emptyMap()
+        }
+    }
+
+    fun setMenuConfig(cfg: Map<String, Boolean>) {
+        val arr = JSONArray()
+        cfg.forEach { (id, enabled) -> arr.put(JSONObject().put("id", id).put("enabled", enabled)) }
+        prefs.edit().putString("menu_config", arr.toString()).apply()
+    }
 }

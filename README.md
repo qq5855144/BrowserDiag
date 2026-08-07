@@ -16,14 +16,22 @@
 | 高级诊断 | `browser_perf`（TTFB/加载时序/慢资源） `browser_assert`（断言检查） `browser_report`（一键诊断报告） `browser_route`（请求拦截 mock） `browser_source`（页面源码） |
 | Flutter 辅助 | `browser_flutter`（语义树启用/节点查询/按 label 点击） |
 
-## 独立 APK 浏览器功能（v3.0 — Chrome 设计语言 + 矢量图标）
+## 独立 APK 浏览器功能（v3.1 — Chrome 设计语言 + 矢量图标 + X 浏览器增强）
 
 | 功能 | 说明 |
 |---|---|
 | **Chrome 风格 UI** | 浅色 Material 配色（#F0F0F0/#202020/#1A73E8），胶囊地址栏，全矢量图标（34 个 Material VectorDrawable，无 emoji） |
 | **多标签页** | 最多 5 个标签，独立前进/后退栈，标签管理对话框 |
 | **底部导航栏** | 主页 / 后退 / 前进 / 刷新 / 标签 / 菜单（全矢量图标） |
-| **分组功能菜单** | 📌页面 / 🌐工具 / ⚙️设置 三组 18 项，图标+文字 |
+| **分组功能菜单** | 📌页面 / 🌐工具 / ⚙️设置 三组 26 项，图标+文字 |
+| **全屏模式** | 沉浸式浏览（隐藏顶栏/状态栏/底栏） |
+| **网络日志面板** | 实时展示 XHR/fetch 请求列表（方法/状态码/URL），点击复制 |
+| **下载管理** | 列出系统下载记录，点击直接打开文件 |
+| **广告拦截** | 26 个广告域名黑名单请求级屏蔽，一键开关 |
+| **允许调试网页** | WebView 远程调试开关（chrome://inspect 可连接） |
+| **字体大小** | 50%-200% textZoom 调节，持久化 |
+| **屏幕方向** | 自动 / 竖屏锁定 / 横屏锁定 |
+| **定制菜单** | 26 个菜单项显隐配置（持久化） |
 | **书签** | 收藏当前页 / 管理（最多 100 条，持久化） |
 | **保存页面** | outerHTML → 「下载」目录 .html |
 | **分享页面** | 系统分享（文字+链接） |
@@ -41,7 +49,22 @@
 | **UA 切换** | Android / 桌面 Chrome / iPhone Safari |
 | **油猴脚本** | document-start 注入 + URL 匹配规则 |
 | **历史记录** | 最近 50 条，一键清空 |
-| **诊断 API** | 内嵌 :8788 HTTP 服务器（browser_source 等 10 个 API） |
+| **诊断 API** | 内嵌 :8788 HTTP 服务器（17 个 API，含 mcp-chrome 增强） |
+
+### 诊断 API（v3.1，17 个，参考 mcp-chrome 工具集）
+
+| API | 说明 | 对应 mcp-chrome |
+|---|---|---|
+| `browser_state` / `browser_console` / `browser_network` | 页面状态 / console / 网络日志 | chrome_console / chrome_network_capture |
+| `browser_eval` | 执行任意 JS | chrome_inject_script |
+| `browser_open` / `browser_close` / `browser_screenshot` / `browser_perf` / `browser_report` / `browser_source` | 打开/关闭/截图/性能/报告/源码 | chrome_navigate / chrome_screenshot |
+| `browser_tabs` | 列出全部标签（id/title/url/激活） | get_windows_and_tabs |
+| `browser_text` | 提取页面正文文本 | chrome_get_web_content |
+| `browser_interactive` | 可点击元素列表（含 CSS 选择器） | chrome_get_interactive_elements |
+| `browser_history` | 历史搜索（keyword/limit） | chrome_history |
+| `browser_bookmarks` | 书签查询/添加/删除 | chrome_bookmark_search/add/delete |
+| `browser_http` | 自定义 HTTP GET（状态码/头/正文） | chrome_network_request |
+| `browser_netlog` | 网络请求完整日志 | chrome_network_capture |
 
 ## 快速开始
 
