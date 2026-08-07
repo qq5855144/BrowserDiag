@@ -72,6 +72,43 @@ class Settings(private val ctx: Context) {
     private val prefs: SharedPreferences =
         ctx.getSharedPreferences("browserdiag_settings", Context.MODE_PRIVATE)
 
+    // ---------- 深色主题 ----------
+    var darkMode: Boolean
+        get() = prefs.getBoolean("dark_mode", false)
+        set(v) = prefs.edit().putBoolean("dark_mode", v).apply()
+
+    // ---------- 书签 ----------
+    fun getBookmarks(): List<Pair<String, String>> { // name, url
+        val raw = prefs.getString("bookmarks", null) ?: return emptyList()
+        return try {
+            val arr = JSONArray(raw)
+            (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                o.optString("name") to o.optString("url")
+            }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    fun addBookmark(name: String, url: String) {
+        val list = getBookmarks().toMutableList()
+        list.removeAll { it.second == url }
+        list.add(0, name to url)
+        if (list.size > 100) list.subList(100, list.size).clear()
+        saveBookmarks(list)
+    }
+
+    fun removeBookmark(url: String) {
+        saveBookmarks(getBookmarks().filter { it.second != url })
+    }
+
+    private fun saveBookmarks(list: List<Pair<String, String>>) {
+        val arr = JSONArray()
+        list.forEach { (n, u) -> arr.put(JSONObject().put("name", n).put("url", u)) }
+        prefs.edit().putString("bookmarks", arr.toString()).apply()
+    }
+
     // ---------- 搜索引擎 ----------
     var engine: SearchEngine
         get() = SearchEngine.fromName(prefs.getString("engine", null))

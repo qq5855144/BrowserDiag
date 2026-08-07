@@ -7,29 +7,43 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
+import android.speech.tts.TextToSpeech
 import android.text.InputType
 import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
+import android.view.inputmethod.EditorInfo
 import android.webkit.ConsoleMessage
 import android.webkit.DownloadListener
 import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.ImageButton
+import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
-import androidx.webkit.ScriptHandler
+import androidx.core.content.ContextCompat
+import androidx.core.graphics.drawable.IconCompat
+import androidx.core.content.pm.ShortcutInfoCompat
+import androidx.core.content.pm.ShortcutManagerCompat
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.qrcode.QRCodeWriter
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -38,34 +52,56 @@ import java.io.StringWriter
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.net.URLEncoder
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * BrowserDiag 2.1：底部导航浏览器 + 内嵌 HTTP 诊断服务器（:8788）。
- * 功能：搜索引擎切换 / UA 切换 / 油猴脚本（document-start 注入）/ 网页源码 zip 打包 / 历史。
+ * BrowserDiag 3.0：Chrome 风格底部导航浏览器 + 内嵌 HTTP 诊断服务器（:8788）。
+ * 功能：多标签 / 搜索引擎切换 / UA 切换 / 深色主题 / 油猴脚本 / 书签 / 保存页面 / 分享 /
+ * 页面查找 / 翻译 / 媒体嗅探 / 页面资源 / 源码 zip / 语音播报 / 二维码 / 添加到桌面 / 历史。
  * 平时可作普通浏览器使用，也可作为诊断后端供其它 AI 工具通过 HTTP 调用。
  */
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var webView: WebView
     private lateinit var urlInput: EditText
     private lateinit var statusBar: TextView
     private lateinit var settings: Settings
+    private lateinit var tabs: Tabs
+    private lateinit var webContainer: FrameLayout
+    private lateinit var topBar: LinearLayout
+    private lateinit var bottomBar: LinearLayout
+    private lateinit var findBar: LinearLayout
+    private lateinit var findInput: EditText
     private val consoleLogs = mutableListOf<JSONObject>()
-    private val scriptHandlers = ConcurrentHashMap<String, ScriptHandler>()
+    private val scriptHandlers = ConcurrentHashMap<String, androidx.webkit.ScriptHandler>()
     private var server: DiagServer? = null
     private var lastTitle: String = ""
+    private var tts: TextToSpeech? = null
+    private var isDark = false
+
+    // 主题色
+    private val C_BAR_LIGHT = 0xFFF0F0F0.toInt()
+    private val C_BAR_DARK = 0xFF1E293B.toInt()
+    private val C_TEXT_LIGHT = 0xFF202020.toInt()
+    private val C_TEXT_DARK = 0xFFE2E8F0.toInt()
+    private val C_FIELD_LIGHT = 0xFFFFFFFF.toInt()
+    private val C_FIELD_DARK = 0xFF334155.toInt()
+    private val C_STATUS_LIGHT = 0xFFE2E8F0.toInt()
+    private val C_STATUS_DARK = 0xFF0F172A.toInt()
+    private val C_ACCENT = 0xFF1A73E8.toInt()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         installCrashHandler()
         super.onCreate(savedInstanceState)
         settings = Settings(this)
+        isDark = settings.darkMode
         buildUi()
-        setupWebView()
         startServer()
+        newTab(settings.engine.homeUrl, first = true)
+        applyTheme()
     }
 
-    // ==================== 崩溃捕获（日志写入下载目录） ====================
+    // ==================== 崩溃捕获 ====================
     private fun installCrashHandler() {
         Thread.setDefaultUncaughtExceptionHandler { _, e ->
             val sw = StringWriter()
@@ -97,7 +133,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ==================== UI 构建 ====================
-    @SuppressLint("SetJavaScriptEnabled")
     private fun buildUi() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -106,89 +141,175 @@ class MainActivity : AppCompatActivity() {
             )
         }
 
-        // ---------- 顶部：地址/搜索栏 ----------
-        val topBar = LinearLayout(this).apply {
+        // ---- 顶部：胶囊地址栏 ----
+        topBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(8, 8, 8, 8)
-            setBackgroundColor(0xFF1E293B.toInt())
+            setPadding(10, 8, 10, 8)
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
             )
         }
-        urlInput = EditText(this).apply {
-            hint = "输入网址或搜索"
-            textSize = 15f
-            setSingleLine(true)
-            inputType = InputType.TYPE_TEXT_VARIATION_URI or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-            setBackgroundColor(0xFFF1F5F9.toInt())
-            setPadding(14, 6, 14, 6)
+        val fieldWrap = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(12, 0, 4, 0)
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
-        topBar.addView(urlInput)
-
-        topBar.addView(Button(this).apply {
-            text = "前往"
-            setOnClickListener { navigate(urlInput.text.toString()) }
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
-            )
-        })
+        fieldWrap.addView(iconBtn(R.drawable.ic_search, 20) { /* 占位：点击聚焦输入框 */ urlInput.requestFocus() })
+        urlInput = EditText(this).apply {
+            hint = "搜索或输入网址"
+            textSize = 15f
+            background = null
+            setSingleLine(true)
+            inputType = InputType.TYPE_TEXT_VARIATION_URI or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            imeOptions = EditorInfo.IME_ACTION_GO
+            setOnEditorActionListener { _, actionId, _ ->
+                if (actionId == EditorInfo.IME_ACTION_GO) { navigate(urlInput.text.toString()); true } else false
+            }
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        fieldWrap.addView(urlInput)
+        topBar.addView(fieldWrap)
+        topBar.addView(iconBtn(R.drawable.ic_arrow, 22) { navigate(urlInput.text.toString()) })
         root.addView(topBar)
 
-        // ---------- 状态栏（API 地址提示） ----------
+        // ---- 查找栏（默认隐藏） ----
+        findBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(10, 4, 10, 4)
+            visibility = View.GONE
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+        findInput = EditText(this).apply {
+            hint = "查找内容"
+            textSize = 14f
+            setSingleLine(true)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        findBar.addView(findInput)
+        findBar.addView(iconBtn(R.drawable.ic_arrow, 18) { findNext(false) }) // 上一个
+        findBar.addView(iconBtn(R.drawable.ic_forward, 18) { findNext(true) }) // 下一个
+        findBar.addView(iconBtn(R.drawable.ic_close, 18) { hideFindBar() })
+        root.addView(findBar)
+
+        // ---- 状态栏 ----
         statusBar = TextView(this).apply {
             text = "启动中…"
-            textSize = 12f
-            setPadding(12, 6, 12, 6)
-            setBackgroundColor(0xFF0F172A.toInt())
-            setTextColor(0xFF94A3B8.toInt())
+            textSize = 11f
+            setPadding(12, 4, 12, 4)
+            setSingleLine(true)
         }
         root.addView(statusBar)
 
-        // ---------- WebView ----------
-        webView = try {
-            WebView(this)
-        } catch (e: Exception) {
-            statusBar.text = "WebView 初始化失败: ${e.message}"
-            WebView(this).apply { setBackgroundColor(android.graphics.Color.DKGRAY) }
+        // ---- WebView 容器 ----
+        webContainer = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
+            )
         }
-        webView.layoutParams = LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
-        )
-        root.addView(webView)
+        root.addView(webContainer)
 
-        // ---------- 底部导航栏 ----------
-        val bottomBar = LinearLayout(this).apply {
+        // ---- 底部导航栏（矢量图标） ----
+        bottomBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            setPadding(0, 6, 0, 6)
-            setBackgroundColor(0xFF1E293B.toInt())
+            setPadding(0, 4, 0, 4)
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
             )
         }
-        fun navButton(symbol: String, action: () -> Unit): Button =
-            Button(this).apply {
-                text = symbol
-                textSize = 18f
-                setOnClickListener { action() }
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            }
-        bottomBar.addView(navButton("🏠") { goHome() })
-        bottomBar.addView(navButton("◀") { if (webView.canGoBack()) webView.goBack() })
-        bottomBar.addView(navButton("▶") { if (webView.canGoForward()) webView.goForward() })
-        bottomBar.addView(navButton("⟳") { webView.reload() })
-        bottomBar.addView(navButton("☰") { showMainMenu() })
+        bottomBar.addView(navBtn(R.drawable.ic_home) { goHome() })
+        bottomBar.addView(navBtn(R.drawable.ic_back) { currentWeb()?.let { if (it.canGoBack()) it.goBack() } })
+        bottomBar.addView(navBtn(R.drawable.ic_forward) { currentWeb()?.let { if (it.canGoForward()) it.goForward() } })
+        bottomBar.addView(navBtn(R.drawable.ic_refresh) { currentWeb()?.reload() })
+        bottomBar.addView(navBtn(R.drawable.ic_tab) { showTabsDialog() })
+        bottomBar.addView(navBtn(R.drawable.ic_menu) { showMainMenu() })
         root.addView(bottomBar)
 
         setContentView(root)
     }
 
-    // ==================== WebView 配置 ====================
+    private fun iconBtn(drawableRes: Int, sizeDp: Int = 24, action: () -> Unit): ImageButton {
+        val dp = (sizeDp * resources.displayMetrics.density).toInt()
+        return ImageButton(this).apply {
+            setImageResource(drawableRes)
+            setBackgroundColor(Color.TRANSPARENT)
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+            layoutParams = LinearLayout.LayoutParams(dp + 12, dp + 12)
+            setOnClickListener { action() }
+        }
+    }
+
+    private fun navBtn(drawableRes: Int, action: () -> Unit): ImageButton =
+        ImageButton(this).apply {
+            setImageResource(drawableRes)
+            setBackgroundColor(Color.TRANSPARENT)
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+            layoutParams = LinearLayout.LayoutParams(0, 52.dp(), 1f)
+            setOnClickListener { action() }
+        }
+
+    private fun Int.dp(): Int = (this * resources.displayMetrics.density).toInt()
+
+    /** 应用主题（浅色 Chrome 风格 / 深色） */
+    private fun applyTheme() {
+        val bar = if (isDark) C_BAR_DARK else C_BAR_LIGHT
+        val text = if (isDark) C_TEXT_DARK else C_TEXT_LIGHT
+        val field = if (isDark) C_FIELD_DARK else C_FIELD_LIGHT
+        topBar.setBackgroundColor(bar)
+        bottomBar.setBackgroundColor(bar)
+        statusBar.setBackgroundColor(if (isDark) C_STATUS_DARK else C_STATUS_LIGHT)
+        statusBar.setTextColor(if (isDark) C_TEXT_DARK else 0xFF475569.toInt())
+        urlInput.setTextColor(text)
+        urlInput.setHintTextColor(if (isDark) 0xFF94A3B8.toInt() else 0xFF94A3B8.toInt())
+        findBar.setBackgroundColor(if (isDark) C_BAR_DARK else 0xFFE5E7EB.toInt())
+        findInput.setTextColor(text)
+        findInput.setHintTextColor(0xFF94A3B8.toInt())
+        val tint = if (isDark) C_TEXT_DARK else 0xFF374151.toInt()
+        val barChildren = ArrayList<View>()
+        barChildren.addAll(topBar.children())
+        barChildren.addAll(bottomBar.children())
+        barChildren.addAll(findBar.children())
+        barChildren.forEach { v ->
+            if (v is ImageButton) v.setColorFilter(tint)
+        }
+        // 地址栏胶囊背景
+        (topBar.getChildAt(0) as? LinearLayout)?.setBackgroundColor(field)
+        statusBar.text = buildStatusText()
+    }
+
+    private fun LinearLayout.children(): List<View> =
+        (0 until childCount).map { getChildAt(it) }
+
+    private fun buildStatusText(): String {
+        val ip = localIp()
+        val errs = synchronized(consoleLogs) { consoleLogs.filter { it.optString("type") == "error" }.size }
+        return "API: http://$ip:8788  |  ${settings.engine.label}  |  ${settings.uaMode.label}  |  tab ${tabs.size}  |  console: ${consoleLogs.size} (err $errs)"
+    }
+
+    // ==================== 标签管理 ====================
+    private fun currentWeb(): WebView? = tabs.current?.webView
+
+    private fun newTab(url: String, first: Boolean = false) {
+        if (tabs.size >= 5 && !first) {
+            toast("标签已达上限（5 个），请先关闭标签")
+            return
+        }
+        val tab = tabs.create(webContainer, url)
+        configureWebView(tab.webView)
+        tabs.switchTo(tab.id)
+        tab.webView.loadUrl(url)
+        urlInput.setText(url)
+        if (first) tabs = tabs // no-op
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
-    private fun setupWebView() {
-        webView.settings.apply {
+    private fun configureWebView(wv: WebView) {
+        wv.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
             mediaPlaybackRequiresUserGesture = false
@@ -199,20 +320,25 @@ class MainActivity : AppCompatActivity() {
             builtInZoomControls = true
             displayZoomControls = false
             cacheMode = WebSettings.LOAD_DEFAULT
-            // UA 模式
             userAgentString = settings.uaMode.uaString(WebSettings.getDefaultUserAgent(this@MainActivity))
         }
-        WebView.setWebContentsDebuggingEnabled(true)
 
-        // 网络 hook：document-start 注入（捕获所有 XHR/fetch）
+        // 网络 hook + 油猴脚本（document-start）
         if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
-            val hookHandler = WebViewCompat.addDocumentStartJavaScript(webView, NETWORK_HOOK_JS, setOf("*"))
-            scriptHandlers["__net_hook__"] = hookHandler
+            try {
+                val h = WebViewCompat.addDocumentStartJavaScript(wv, NETWORK_HOOK_JS, setOf("*"))
+                scriptHandlers["__net_hook_${System.identityHashCode(wv)}"] = h
+            } catch (e: Exception) {
+            }
         }
-        // 油猴脚本注册
-        reapplyScripts()
+        settings.getScripts().filter { it.enabled }.forEach { s ->
+            try {
+                WebViewCompat.addDocumentStartJavaScript(wv, s.code, patternToOriginRules(s.urlPattern))
+            } catch (e: Exception) {
+            }
+        }
 
-        webView.webChromeClient = object : WebChromeClient() {
+        wv.webChromeClient = object : WebChromeClient() {
             override fun onConsoleMessage(msg: ConsoleMessage): Boolean {
                 val entry = JSONObject()
                     .put("ts", System.currentTimeMillis())
@@ -222,31 +348,41 @@ class MainActivity : AppCompatActivity() {
                     consoleLogs.add(entry)
                     if (consoleLogs.size > 500) consoleLogs.removeAt(0)
                 }
-                updateStatus()
+                runOnUiThread { statusBar.text = buildStatusText() }
                 return true
             }
 
             override fun onReceivedTitle(view: WebView?, title: String?) {
                 lastTitle = title ?: ""
-                urlInput.setText(webView.url ?: "")
+                tabs.current?.let { t ->
+                    if (t.webView === view) {
+                        t.title = lastTitle
+                        urlInput.setText(t.url)
+                    }
+                }
             }
         }
 
-        webView.webViewClient = object : WebViewClient() {
+        wv.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView?, url: String?) {
-                url?.let { settings.addHistory(it, lastTitle) }
-                updateStatus()
+                tabs.current?.let { t ->
+                    if (t.webView === view) {
+                        t.url = url ?: ""
+                        settings.addHistory(url ?: "", lastTitle)
+                        urlInput.setText(url ?: "")
+                    }
+                }
+                runOnUiThread { statusBar.text = buildStatusText() }
             }
 
-            override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
-                urlInput.setText(url ?: "")
-                updateStatus()
+            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                if (tabs.current?.webView === view) {
+                    urlInput.setText(url ?: "")
+                }
             }
 
             @Deprecated("Deprecated in Java")
-            override fun onReceivedError(
-                view: WebView?, errorCode: Int, description: String?, failingUrl: String?
-            ) {
+            override fun onReceivedError(view: WebView?, errorCode: Int, description: String?, failingUrl: String?) {
                 val entry = JSONObject()
                     .put("ts", System.currentTimeMillis())
                     .put("type", "error")
@@ -255,12 +391,11 @@ class MainActivity : AppCompatActivity() {
                     consoleLogs.add(entry)
                     if (consoleLogs.size > 500) consoleLogs.removeAt(0)
                 }
-                updateStatus()
+                runOnUiThread { statusBar.text = buildStatusText() }
             }
         }
 
-        // 文件下载支持（普通浏览器）
-        webView.setDownloadListener(DownloadListener { url, _, _, mimeType, _ ->
+        wv.setDownloadListener(DownloadListener { url, _, _, mimeType, _ ->
             try {
                 val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
                 val req = DownloadManager.Request(Uri.parse(url))
@@ -272,37 +407,28 @@ class MainActivity : AppCompatActivity() {
                 toast("下载失败: ${e.message}")
             }
         })
-
-        // 首次加载：当前搜索引擎首页
-        goHome()
     }
 
-    /** 注册当前启用的油猴脚本（启动时调用；变更脚本后通过 recreate() 重建） */
-    private fun reapplyScripts() {
-        if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) return
-        settings.getScripts().filter { it.enabled }.forEach { s ->
-            try {
-                val h = WebViewCompat.addDocumentStartJavaScript(webView, s.code, patternToOriginRules(s.urlPattern))
-                scriptHandlers[s.id] = h
-            } catch (e: Exception) {
-                // 脚本语法错误等，忽略该脚本
+    private fun showTabsDialog() {
+        val all = tabs.all
+        val labels = all.mapIndexed { i, t ->
+            val title = t.title.ifEmpty { t.url }.ifEmpty { "新标签" }
+            val short = if (title.length > 26) title.take(26) + "…" else title
+            "${if (i == tabs.all.indexOf(tabs.current)) "● " else "○ "}$short"
+        }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("标签页（${all.size}/5）")
+            .setItems(labels) { _, which ->
+                tabs.switchTo(all[which].id)
+                tabs.current?.let { urlInput.setText(it.url) }
             }
-        }
-    }
-
-    /** 用户脚本 URL 规则 → WebView origin 规则 */
-    private fun patternToOriginRules(pattern: String): Set<String> {
-        val p = pattern.trim()
-        if (p.isEmpty() || p == "*") return setOf("*")
-        val host = p.trim('*').trim().lowercase()
-            .removePrefix("https://").removePrefix("http://").trim('/')
-        if (host.isEmpty()) return setOf("*")
-        return buildSet {
-            add("https://$host")
-            add("http://$host")
-            add("https://*.$host")
-            add("http://*.$host")
-        }
+            .setPositiveButton("＋ 新标签") { _, _ -> newTab(settings.engine.homeUrl) }
+            .setNeutralButton("关闭当前") { _, _ ->
+                tabs.current?.let { tabs.destroy(it.id) }
+                tabs.current?.let { urlInput.setText(it.url) } ?: run { newTab(settings.engine.homeUrl) }
+            }
+            .setNegativeButton("关闭", null)
+            .show()
     }
 
     // ==================== 导航 ====================
@@ -310,46 +436,424 @@ class MainActivity : AppCompatActivity() {
         val q = input.trim()
         if (q.isEmpty()) return
         val engine = settings.engine
+        val wv = currentWeb() ?: return
         when {
-            q.startsWith("http://") || q.startsWith("https://") -> webView.loadUrl(q)
-            q.startsWith("about:") -> webView.loadUrl(q)
-            // 形如 example.com 的域名
+            q.startsWith("http://") || q.startsWith("https://") -> wv.loadUrl(q)
+            q.startsWith("about:") -> wv.loadUrl(q)
             q.contains(".") && !q.contains(" ") && !q.contains("/") && !q.contains("?") ->
-                webView.loadUrl("https://$q")
-            else -> webView.loadUrl(engine.searchUrl.format(URLEncoder.encode(q, "UTF-8")))
+                wv.loadUrl("https://$q")
+            else -> wv.loadUrl(engine.searchUrl.format(URLEncoder.encode(q, "UTF-8")))
         }
         urlInput.clearFocus()
     }
 
     private fun goHome() {
-        val home = settings.engine.homeUrl
-        webView.loadUrl(home)
-        urlInput.setText(home)
+        currentWeb()?.loadUrl(settings.engine.homeUrl)
+        urlInput.setText(settings.engine.homeUrl)
     }
 
-    // ==================== 主菜单 ====================
+    // ==================== 主菜单（分组 + 矢量图标） ====================
     private fun showMainMenu() {
-        val items = arrayOf(
-            "🔍 搜索引擎：${settings.engine.label}",
-            "📱 UA 模式：${settings.uaMode.label}",
-            "🐒 油猴脚本管理",
-            "📦 下载网页源码 (zip)",
-            "🕘 历史记录",
-            "ℹ️ 关于 / API 地址"
+        val groups = listOf(
+            Pair("📌 页面", listOf(
+                MenuItem(R.drawable.ic_bookmark, "书签") { showBookmarks() },
+                MenuItem(R.drawable.ic_save, "保存页面") { savePage() },
+                MenuItem(R.drawable.ic_share, "分享") { sharePage() },
+                MenuItem(R.drawable.ic_find, "页面查找") { showFindBar() },
+                MenuItem(R.drawable.ic_translate, "翻译本页") { translatePage() },
+                MenuItem(R.drawable.ic_widget, "添加到桌面") { addToHome() }
+            )),
+            Pair("🌐 工具", listOf(
+                MenuItem(R.drawable.ic_movie, "嗅探媒体资源") { sniffMedia() },
+                MenuItem(R.drawable.ic_folder, "查看页面资源") { pageResources() },
+                MenuItem(R.drawable.ic_code, "页面源码 (zip)") { downloadSourceZip() },
+                MenuItem(R.drawable.ic_qr, "生成二维码") { showQr() },
+                MenuItem(R.drawable.ic_mic, "语音播报") { speakPage() },
+                MenuItem(R.drawable.ic_tools, "开发者工具") { devTools() }
+            )),
+            Pair("⚙️ 设置", listOf(
+                MenuItem(R.drawable.ic_dark, "深色主题：${if (isDark) "开" else "关"}") { toggleDark() },
+                MenuItem(R.drawable.ic_search, "搜索引擎：${settings.engine.label}") { showEnginePicker() },
+                MenuItem(R.drawable.ic_phone, "UA：${settings.uaMode.label}") { showUaPicker() },
+                MenuItem(R.drawable.ic_extension, "油猴脚本") { showScriptManager() },
+                MenuItem(R.drawable.ic_history, "历史记录") { showHistory() },
+                MenuItem(R.drawable.ic_info, "关于 / API") { showAbout() }
+            ))
         )
+
+        val scroll = ScrollView(this)
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        for ((groupTitle, items) in groups) {
+            col.addView(TextView(this).apply {
+                text = groupTitle
+                textSize = 13f
+                setPadding(24, 14, 24, 6)
+                setTextColor(C_ACCENT)
+                setTypeface(null, android.graphics.Typeface.BOLD)
+            })
+            items.forEach { item ->
+                col.addView(menuRow(item.icon, item.label) {
+                    item.action()
+                })
+            }
+        }
+        scroll.addView(col)
         AlertDialog.Builder(this)
             .setTitle("功能菜单")
-            .setItems(items) { _, which ->
-                when (which) {
-                    0 -> showEnginePicker()
-                    1 -> showUaPicker()
-                    2 -> showScriptManager()
-                    3 -> downloadSourceZip()
-                    4 -> showHistory()
-                    5 -> showAbout()
+            .setView(scroll)
+            .setNegativeButton("关闭", null)
+            .show()
+    }
+
+    private class MenuItem(val icon: Int, val label: String, val action: () -> Unit)
+
+    private fun menuRow(iconRes: Int, label: String, action: () -> Unit): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(28, 12, 28, 12)
+            setBackgroundResource(android.R.drawable.list_selector_background)
+            isClickable = true
+            setOnClickListener {
+                action()
+                // 关闭对话框：通过标记（findViewWithTag）
+                (parent as? ViewGroup)?.let { p ->
+                    var cur: View? = this
+                    while (cur != null) {
+                        if (cur is ScrollView) break
+                        cur = cur.parent as? View
+                    }
                 }
             }
+            addView(ImageView(this@MainActivity).apply {
+                setImageResource(iconRes)
+                setColorFilter(if (isDark) C_TEXT_DARK else 0xFF374151.toInt())
+                layoutParams = LinearLayout.LayoutParams(28.dp(), 28.dp())
+            })
+            addView(TextView(this@MainActivity).apply {
+                text = label
+                textSize = 15f
+                setTextColor(if (isDark) C_TEXT_DARK else C_TEXT_LIGHT)
+                setPadding(18, 0, 0, 0)
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                )
+            })
+        }
+
+    // ==================== 书签 ====================
+    private fun showBookmarks() {
+        val bookmarks = settings.getBookmarks()
+        if (bookmarks.isEmpty()) {
+            addCurrentToBookmarks()
+            return
+        }
+        val labels = bookmarks.map { (n, u) ->
+            val t = n.ifEmpty { u }
+            if (t.length > 34) t.take(34) + "…" else t
+        }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("书签")
+            .setItems(labels) { _, which ->
+                currentWeb()?.loadUrl(bookmarks[which].second)
+            }
+            .setPositiveButton("☆ 收藏当前页") { _, _ -> addCurrentToBookmarks() }
+            .setNeutralButton("删除") { _, _ ->
+                AlertDialog.Builder(this)
+                    .setTitle("删除书签")
+                    .setItems(labels) { _, which ->
+                        settings.removeBookmark(bookmarks[which].second)
+                        toast("已删除")
+                    }
+                    .setNegativeButton("取消", null)
+                    .show()
+            }
+            .setNegativeButton("关闭", null)
             .show()
+    }
+
+    private fun addCurrentToBookmarks() {
+        val url = currentWeb()?.url ?: return
+        if (url.isEmpty()) { toast("当前无页面"); return }
+        val name = lastTitle.ifEmpty { url }
+        settings.addBookmark(name, url)
+        toast("已收藏：$name")
+    }
+
+    // ==================== 保存页面 / 分享 / 查找 / 翻译 ====================
+    private fun savePage() {
+        val wv = currentWeb() ?: return
+        val url = wv.url ?: return
+        if (url.isEmpty() || url == "about:blank") { toast("当前没有可保存的页面"); return }
+        statusBar.text = "正在保存页面…"
+        wv.evaluateJavascript("document.documentElement.outerHTML") { raw ->
+            val html = try {
+                val v = org.json.JSONTokener(raw ?: "\"\"").nextValue()
+                v as? String ?: ""
+            } catch (e: Exception) {
+                ""
+            }
+            val name = "page_${System.currentTimeMillis()}.html"
+            try {
+                if (Build.VERSION.SDK_INT >= 29) {
+                    val values = ContentValues().apply {
+                        put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                        put(MediaStore.MediaColumns.MIME_TYPE, "text/html")
+                        put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                    }
+                    val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    uri?.let { contentResolver.openOutputStream(it)?.use { os -> os.write(html.toByteArray()) } }
+                    runOnUiThread { statusBar.text = "页面已保存 ✅ $name"; toast("页面已保存到下载目录") }
+                } else {
+                    val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                    dir.mkdirs()
+                    File(dir, name).writeText(html)
+                    runOnUiThread { statusBar.text = "页面已保存 ✅ $name"; toast("页面已保存到下载目录") }
+                }
+            } catch (e: Exception) {
+                runOnUiThread { statusBar.text = "保存失败 ❌ ${e.message}"; toast("保存失败：${e.message}") }
+            }
+        }
+    }
+
+    private fun sharePage() {
+        val url = currentWeb()?.url ?: return
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_TEXT, "${lastTitle.ifEmpty { url }}\n$url")
+        }
+        startActivity(Intent.createChooser(send, "分享页面"))
+    }
+
+    private fun showFindBar() {
+        findBar.visibility = View.VISIBLE
+        findInput.requestFocus()
+    }
+
+    private fun hideFindBar() {
+        findBar.visibility = View.GONE
+        currentWeb()?.clearMatches()
+    }
+
+    private fun findNext(forward: Boolean) {
+        val q = findInput.text.toString()
+        if (q.isEmpty()) return
+        currentWeb()?.let { wv ->
+            wv.findAllAsync(q)
+            wv.findNext(forward)
+        }
+    }
+
+    private fun translatePage() {
+        val url = currentWeb()?.url ?: return
+        val tUrl = "https://translate.google.com/translate?u=" + URLEncoder.encode(url, "UTF-8")
+        currentWeb()?.loadUrl(tUrl)
+        urlInput.setText(tUrl)
+    }
+
+    // ==================== 媒体嗅探 / 页面资源 ====================
+    private fun sniffMedia() {
+        val wv = currentWeb() ?: return
+        statusBar.text = "正在嗅探媒体资源…"
+        wv.evaluateJavascript(
+            "(function(){var out=[];document.querySelectorAll('video,audio').forEach(function(m){if(m.src)out.push(m.src);m.querySelectorAll('source').forEach(function(s){if(s.src)out.push(s.src);});});if(window.__bdNet)window.__bdNet.forEach(function(n){if(/\\.(mp4|m3u8|mp3|webm|flv|m4a|ogg|aac)(\\?|$)/i.test(n.url))out.push(n.url);});return JSON.stringify(out);})()"
+        ) { raw ->
+            val list = try {
+                val v = org.json.JSONTokener(raw ?: "[]").nextValue()
+                (v as? JSONArray)?.let { arr -> (0 until arr.length()).map { arr.getString(it) } } ?: emptyList()
+            } catch (e: Exception) {
+                emptyList()
+            }
+            runOnUiThread {
+                if (list.isEmpty()) {
+                    statusBar.text = "未发现媒体资源"
+                    toast("未发现媒体资源")
+                    return@runOnUiThread
+                }
+                statusBar.text = "发现 ${list.size} 个媒体资源"
+                showUrlListDialog("媒体资源（点击下载）", list)
+            }
+        }
+    }
+
+    private fun pageResources() {
+        val wv = currentWeb() ?: return
+        wv.evaluateJavascript(
+            "(function(){var out=[];document.querySelectorAll('img[src],script[src],link[href]').forEach(function(e){var u=e.src||e.href;if(u&&u.indexOf('data:')!==0)out.push(u);});return JSON.stringify(out.slice(0,60));})()"
+        ) { raw ->
+            val list = try {
+                val v = org.json.JSONTokener(raw ?: "[]").nextValue()
+                (v as? JSONArray)?.let { arr -> (0 until arr.length()).map { arr.getString(it) } } ?: emptyList()
+            } catch (e: Exception) {
+                emptyList()
+            }
+            runOnUiThread {
+                if (list.isEmpty()) toast("未发现资源") else showUrlListDialog("页面资源（点击打开）", list)
+            }
+        }
+    }
+
+    private fun showUrlListDialog(title: String, urls: List<String>) {
+        val labels = urls.map { if (it.length > 60) it.take(60) + "…" else it }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("$title（${urls.size}）")
+            .setItems(labels) { _, which ->
+                val url = urls[which]
+                AlertDialog.Builder(this)
+                    .setTitle("操作")
+                    .setItems(arrayOf("在浏览器中打开", "下载", "复制链接")) { _, op ->
+                        when (op) {
+                            0 -> currentWeb()?.loadUrl(url)
+                            1 -> {
+                                try {
+                                    val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                                    val req = DownloadManager.Request(Uri.parse(url))
+                                    req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                                    dm.enqueue(req)
+                                    toast("已加入下载队列")
+                                } catch (e: Exception) {
+                                    toast("下载失败：${e.message}")
+                                }
+                            }
+                            2 -> {
+                                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                cm.setPrimaryClip(ClipData.newPlainText("url", url))
+                                toast("已复制链接")
+                            }
+                        }
+                    }
+                    .show()
+            }
+            .setNegativeButton("关闭", null)
+            .show()
+    }
+
+    // ==================== 语音播报 ====================
+    private fun speakPage() {
+        val wv = currentWeb() ?: return
+        wv.evaluateJavascript("document.body?document.body.innerText.slice(0,4000):''") { raw ->
+            val text = try {
+                val v = org.json.JSONTokener(raw ?: "\"\"").nextValue()
+                v as? String ?: ""
+            } catch (e: Exception) {
+                ""
+            }
+            if (text.isBlank()) {
+                runOnUiThread { toast("页面没有可朗读的文本") }
+                return@evaluateJavascript
+            }
+            runOnUiThread {
+                if (tts == null) {
+                    tts = TextToSpeech(this) { status ->
+                        if (status == TextToSpeech.SUCCESS) {
+                            tts?.language = Locale.CHINA
+                            tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "bd_speak")
+                            toast("开始朗读（再次点击停止）")
+                        }
+                    }
+                } else {
+                    if (tts!!.isSpeaking) {
+                        tts!!.stop()
+                        toast("已停止朗读")
+                    } else {
+                        tts!!.speak(text, TextToSpeech.QUEUE_FLUSH, null, "bd_speak")
+                        toast("开始朗读（再次点击停止）")
+                    }
+                }
+            }
+        }
+    }
+
+    // ==================== 二维码 ====================
+    private fun showQr() {
+        val url = currentWeb()?.url ?: run { toast("当前无页面"); return }
+        try {
+            val size = 512
+            val matrix = QRCodeWriter().encode(url, BarcodeFormat.QR_CODE, size, size)
+            val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.RGB_565)
+            for (y in 0 until size) for (x in 0 until size) {
+                bmp.setPixel(x, y, if (matrix[x, y]) Color.BLACK else Color.WHITE)
+            }
+            val img = ImageView(this).apply {
+                setImageBitmap(bmp)
+                setPadding(40, 24, 40, 0)
+            }
+            val col = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(img)
+                addView(TextView(this@MainActivity).apply {
+                    text = url.take(60)
+                    textSize = 12f
+                    gravity = Gravity.CENTER
+                    setPadding(16, 10, 16, 20)
+                })
+            }
+            AlertDialog.Builder(this)
+                .setTitle("页面二维码")
+                .setView(col)
+                .setPositiveButton("复制链接") { _, _ ->
+                    val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    cm.setPrimaryClip(ClipData.newPlainText("url", url))
+                    toast("已复制链接")
+                }
+                .setNegativeButton("关闭", null)
+                .show()
+        } catch (e: Exception) {
+            toast("二维码生成失败：${e.message}")
+        }
+    }
+
+    // ==================== 添加到桌面 ====================
+    private fun addToHome() {
+        val url = currentWeb()?.url ?: return
+        val title = lastTitle.ifEmpty { url }
+        val id = "bd_${url.hashCode()}"
+        val intent = Intent(this, MainActivity::class.java).apply {
+            action = Intent.ACTION_VIEW
+            data = Uri.parse(url)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        }
+        val info = ShortcutInfoCompat.Builder(this, id)
+            .setIntent(intent)
+            .setShortLabel(title.take(10))
+            .setLongLabel(title)
+            .setIcon(IconCompat.createWithResource(this, R.mipmap.ic_launcher))
+            .build()
+        if (ShortcutManagerCompat.requestPinShortcut(this, info, null)) {
+            toast("已请求添加到桌面")
+        } else {
+            toast("设备不支持固定快捷方式")
+        }
+    }
+
+    // ==================== 开发者工具 ====================
+    private fun devTools() {
+        val ip = localIp()
+        val wv = currentWeb()
+        AlertDialog.Builder(this)
+            .setTitle("开发者工具")
+            .setMessage(
+                "HTTP API：http://$ip:8788\n" +
+                    "工具：browser_open/state/console/network/eval/screenshot/perf/report/source/close\n\n" +
+                    "当前标签：${wv?.url ?: "无"}\n" +
+                    "console 日志：${consoleLogs.size}（错误 ${consoleLogs.filter { it.optString("type") == "error" }.size}）\n\n" +
+                    "提示：其它 AI 工具可通过 HTTP 调用本浏览器诊断与操作页面。"
+            )
+            .setPositiveButton("复制 API 地址") { _, _ ->
+                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("api", "http://$ip:8788"))
+                toast("已复制 http://$ip:8788")
+            }
+            .setNegativeButton("关闭", null)
+            .show()
+    }
+
+    // ==================== 深色主题 / 引擎 / UA / 油猴 / 历史 / 关于 ====================
+    private fun toggleDark() {
+        isDark = !isDark
+        settings.darkMode = isDark
+        applyTheme()
+        toast(if (isDark) "已切换到深色主题" else "已切换到浅色主题")
     }
 
     private fun showEnginePicker() {
@@ -374,7 +878,7 @@ class MainActivity : AppCompatActivity() {
             .setTitle("User-Agent")
             .setSingleChoiceItems(labels, current) { d, which ->
                 settings.uaMode = modes[which]
-                webView.settings.userAgentString =
+                currentWeb()?.settings?.userAgentString =
                     modes[which].uaString(WebSettings.getDefaultUserAgent(this))
                 d.dismiss()
                 toast("UA 已切换：${modes[which].label}（刷新页面生效）")
@@ -382,7 +886,6 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    // ==================== 油猴脚本管理 ====================
     private fun showScriptManager() {
         val scripts = settings.getScripts()
         if (scripts.isEmpty()) {
@@ -458,48 +961,6 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    // ==================== 网页源码 zip 打包 ====================
-    private fun downloadSourceZip() {
-        val currentUrl = webView.url ?: ""
-        if (currentUrl.isEmpty() || currentUrl == "about:blank") {
-            toast("当前没有可打包的页面")
-            return
-        }
-        statusBar.text = "正在获取网页源码…"
-        webView.evaluateJavascript("document.documentElement.outerHTML") { raw ->
-            val html = try {
-                val v = org.json.JSONTokener(raw ?: "\"\"").nextValue()
-                v as? String ?: ""
-            } catch (e: Exception) {
-                ""
-            }
-            val consoleJson = synchronized(consoleLogs) { JSONArray(consoleLogs.toList()).toString() }
-            webView.evaluateJavascript("JSON.stringify(window.__bdNet||[])") { netRaw ->
-                val netJson = try {
-                    val v = org.json.JSONTokener(netRaw ?: "[]").nextValue()
-                    v as? String ?: "[]"
-                } catch (e: Exception) {
-                    "[]"
-                }
-                SourcePacker.pack(
-                    context = this,
-                    url = currentUrl,
-                    title = lastTitle,
-                    html = html,
-                    consoleJson = consoleJson,
-                    networkJson = netJson,
-                    ua = webView.settings.userAgentString
-                ) { ok, msg ->
-                    runOnUiThread {
-                        statusBar.text = if (ok) "源码已保存 ✅ $msg" else "打包失败 ❌ $msg"
-                        toast(if (ok) "网页源码已保存：$msg" else "打包失败：$msg")
-                    }
-                }
-            }
-        }
-    }
-
-    // ==================== 历史 ====================
     private fun showHistory() {
         val history = settings.getHistory()
         if (history.isEmpty()) {
@@ -517,7 +978,7 @@ class MainActivity : AppCompatActivity() {
         AlertDialog.Builder(this)
             .setTitle("最近访问（${history.size}）")
             .setItems(labels) { _, which ->
-                webView.loadUrl(history[which].first)
+                currentWeb()?.loadUrl(history[which].first)
             }
             .setPositiveButton("清空") { _, _ ->
                 settings.clearHistory()
@@ -529,13 +990,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun showAbout() {
         val ip = localIp()
-        val ua = webView.settings.userAgentString
+        val ua = currentWeb()?.settings?.userAgentString ?: ""
         AlertDialog.Builder(this)
             .setTitle("BrowserDiag")
             .setMessage(
-                "版本：2.1.0\n" +
+                "版本：3.0.0\n" +
                     "HTTP API：http://$ip:8788\n" +
-                    "支持：搜索引擎切换 / UA 切换 / 油猴脚本 / 源码打包\n" +
+                    "功能：多标签 / 搜索引擎 / UA / 深色主题 / 油猴 / 书签 / 源码打包 / 嗅探 / 二维码 / 语音等\n" +
                     "\n当前 UA：\n${ua.take(120)}"
             )
             .setPositiveButton("复制 API 地址") { _, _ ->
@@ -547,7 +1008,63 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    // ==================== 服务器 ====================
+    // ==================== 源码 zip（保留 v2.1） ====================
+    private fun downloadSourceZip() {
+        val wv = currentWeb() ?: return
+        val currentUrl = wv.url ?: ""
+        if (currentUrl.isEmpty() || currentUrl == "about:blank") {
+            toast("当前没有可打包的页面")
+            return
+        }
+        statusBar.text = "正在获取网页源码…"
+        wv.evaluateJavascript("document.documentElement.outerHTML") { raw ->
+            val html = try {
+                val v = org.json.JSONTokener(raw ?: "\"\"").nextValue()
+                v as? String ?: ""
+            } catch (e: Exception) {
+                ""
+            }
+            val consoleJson = synchronized(consoleLogs) { JSONArray(consoleLogs.toList()).toString() }
+            wv.evaluateJavascript("JSON.stringify(window.__bdNet||[])") { netRaw ->
+                val netJson = try {
+                    val v = org.json.JSONTokener(netRaw ?: "[]").nextValue()
+                    v as? String ?: "[]"
+                } catch (e: Exception) {
+                    "[]"
+                }
+                SourcePacker.pack(
+                    context = this,
+                    url = currentUrl,
+                    title = lastTitle,
+                    html = html,
+                    consoleJson = consoleJson,
+                    networkJson = netJson,
+                    ua = wv.settings.userAgentString
+                ) { ok, msg ->
+                    runOnUiThread {
+                        statusBar.text = if (ok) "源码已保存 ✅ $msg" else "打包失败 ❌ $msg"
+                        toast(if (ok) "网页源码已保存：$msg" else "打包失败：$msg")
+                    }
+                }
+            }
+        }
+    }
+
+    // ==================== 油猴规则 / 服务器 ====================
+    private fun patternToOriginRules(pattern: String): Set<String> {
+        val p = pattern.trim()
+        if (p.isEmpty() || p == "*") return setOf("*")
+        val host = p.trim('*').trim().lowercase()
+            .removePrefix("https://").removePrefix("http://").trim('/')
+        if (host.isEmpty()) return setOf("*")
+        return buildSet {
+            add("https://$host")
+            add("http://$host")
+            add("https://*.$host")
+            add("http://*.$host")
+        }
+    }
+
     private fun startServer() {
         var port = 8788
         var started = false
@@ -556,7 +1073,7 @@ class MainActivity : AppCompatActivity() {
                 val s = DiagServer(
                     port,
                     applicationContext,
-                    { if (::webView.isInitialized) webView else null },
+                    { tabs.current?.webView },
                     { synchronized(consoleLogs) { consoleLogs.toList() } }
                 )
                 s.start(500, true)
@@ -570,15 +1087,7 @@ class MainActivity : AppCompatActivity() {
         if (!started) {
             statusBar.text = "API 服务启动失败（端口 8788-8791 均被占用）"
         } else {
-            updateStatus()
-        }
-    }
-
-    private fun updateStatus() {
-        runOnUiThread {
-            val ip = localIp()
-            val errs = synchronized(consoleLogs) { consoleLogs.filter { it.optString("type") == "error" }.size }
-            statusBar.text = "API: http://$ip:8788  |  ${settings.engine.label}  |  ${settings.uaMode.label}  |  console: ${consoleLogs.size} (err $errs)"
+            statusBar.text = buildStatusText()
         }
     }
 
@@ -600,15 +1109,22 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         server?.stop()
+        tts?.stop()
+        tts?.shutdown()
+        tabs.destroyAll()
         super.onDestroy()
     }
 
     override fun onBackPressed() {
-        if (webView.canGoBack()) webView.goBack() else super.onBackPressed()
+        if (findBar.visibility == View.VISIBLE) {
+            hideFindBar()
+            return
+        }
+        val wv = currentWeb()
+        if (wv != null && wv.canGoBack()) wv.goBack() else super.onBackPressed()
     }
 
     companion object {
-        /** XHR/fetch 网络监听 hook（document-start 注入） */
         private val NETWORK_HOOK_JS = """
             (function(){
               if (window.__bdHooked) return;
