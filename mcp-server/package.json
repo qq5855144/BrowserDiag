@@ -1,17 +1,30 @@
 {
   "name": "browser-diag",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+  "version": "3.2.0",
+  "description": "Browser diagnostics and automation tools for MCP, CLI, and authenticated HTTP use.",
+  "main": "server.js",
+  "bin": {
+    "browser-diag": "./server.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js && node --test",
+    "test": "node --test"
+  },
+  "keywords": [
+    "mcp",
+    "browser",
+    "diagnostics",
+    "playwright"
+  ],
+  "license": "MIT",
   "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
-    "playwright-core": "^1.62.1"
+    "playwright-core": "^1.62.1",
+    "zod": "^4.4.3"
   }
 }
