@@ -1,5 +1,6 @@
 package com.browserdiag.app
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.app.AlertDialog
 import android.app.DownloadManager
@@ -23,7 +24,6 @@ import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
-import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
 import android.webkit.ConsoleMessage
 import android.webkit.DownloadListener
@@ -42,6 +42,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.graphics.drawable.IconCompat
 import androidx.core.content.pm.ShortcutInfoCompat
@@ -59,10 +60,9 @@ import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.net.URLEncoder
 import java.util.Locale
-import java.util.concurrent.ConcurrentHashMap
 
 /**
- * BrowserDiag 3.0：Chrome 风格底部导航浏览器 + 内嵌 HTTP 诊断服务器（:8788）。
+ * BrowserDiag 3.2：Chrome 风格底部导航浏览器 + 带 Token 认证的内嵌 HTTP 诊断服务器。
  * 功能：多标签 / 搜索引擎切换 / UA 切换 / 深色主题 / 油猴脚本 / 书签 / 保存页面 / 分享 /
  * 页面查找 / 翻译 / 媒体嗅探 / 页面资源 / 源码 zip / 语音播报 / 二维码 / 添加到桌面 / 历史。
  * 平时可作普通浏览器使用，也可作为诊断后端供其它 AI 工具通过 HTTP 调用。
@@ -79,11 +79,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var findBar: LinearLayout
     private lateinit var findInput: EditText
     private val consoleLogs = mutableListOf<JSONObject>()
-    private val scriptHandlers = ConcurrentHashMap<String, androidx.webkit.ScriptHandler>()
     private var server: DiagServer? = null
-    private var lastTitle: String = ""
+    private var serverPort = 8788
     private var tts: TextToSpeech? = null
     private var isDark = false
+    private var isFullscreen = false
+    private var mainMenuDialog: AlertDialog? = null
 
     // 主题色
     private val C_BAR_LIGHT = 0xFFF0F0F0.toInt()
@@ -100,16 +101,20 @@ class MainActivity : AppCompatActivity() {
         installCrashHandler()
         super.onCreate(savedInstanceState)
         settings = Settings(this)
+        tabs = Tabs(this)
         isDark = settings.darkMode
+        WebView.setWebContentsDebuggingEnabled(settings.debugWeb)
+        applySavedOrientation()
         buildUi()
+        newTab(initialUrlFromIntent(intent) ?: settings.engine.homeUrl)
         startServer()
-        newTab(settings.engine.homeUrl, first = true)
         applyTheme()
     }
 
     // ==================== 崩溃捕获 ====================
     private fun installCrashHandler() {
-        Thread.setDefaultUncaughtExceptionHandler { _, e ->
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, e ->
             val sw = StringWriter()
             e.printStackTrace(PrintWriter(sw))
             val text = "BrowserDiag crash @ ${System.currentTimeMillis()}\n$sw"
@@ -133,8 +138,12 @@ class MainActivity : AppCompatActivity() {
                 File(filesDir, "crash.log").writeText(text)
             } catch (ex: Exception) {
             }
-            android.os.Process.killProcess(android.os.Process.myPid())
-            System.exit(2)
+            if (previous != null) {
+                previous.uncaughtException(thread, e)
+            } else {
+                android.os.Process.killProcess(android.os.Process.myPid())
+                System.exit(2)
+            }
         }
     }
 
@@ -292,16 +301,41 @@ class MainActivity : AppCompatActivity() {
         (0 until childCount).map { getChildAt(it) }
 
     private fun buildStatusText(): String {
-        val ip = localIp()
         val errs = synchronized(consoleLogs) { consoleLogs.filter { it.optString("type") == "error" }.size }
-        return "API: http://$ip:8788  |  ${settings.engine.label}  |  ${settings.uaMode.label}  |  tab ${tabs.size}  |  console: ${consoleLogs.size} (err $errs)"
+        val scope = if (settings.lanApiEnabled) "局域网" else "本机"
+        val api = if (server == null) "API: 未启动" else "API: ${apiBaseUrl()} 🔒$scope"
+        return "$api  |  ${settings.engine.label}  |  ${settings.uaMode.label}  |  tab ${tabs.size}  |  console: ${consoleLogs.size} (err $errs)"
+    }
+
+    private fun initialUrlFromIntent(source: Intent?): String? {
+        if (source?.action != Intent.ACTION_VIEW) return null
+        val uri = source.data ?: return null
+        return uri.toString().takeIf {
+            uri.scheme.equals("http", true) || uri.scheme.equals("https", true)
+        }
+    }
+
+    private fun applySavedOrientation() {
+        requestedOrientation = when (settings.screenOrientation) {
+            "portrait" -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            "landscape" -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        initialUrlFromIntent(intent)?.let { target ->
+            currentWeb()?.loadUrl(target) ?: newTab(target)
+        }
     }
 
     // ==================== 标签管理 ====================
     private fun currentWeb(): WebView? = tabs.current?.webView
 
-    private fun newTab(url: String, first: Boolean = false) {
-        if (tabs.size >= 5 && !first) {
+    private fun newTab(url: String) {
+        if (tabs.size >= 5) {
             toast("标签已达上限（5 个），请先关闭标签")
             return
         }
@@ -310,7 +344,6 @@ class MainActivity : AppCompatActivity() {
         tabs.switchTo(tab.id)
         tab.webView.loadUrl(url)
         urlInput.setText(url)
-        if (first) tabs = tabs // no-op
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -319,7 +352,10 @@ class MainActivity : AppCompatActivity() {
             javaScriptEnabled = true
             domStorageEnabled = true
             mediaPlaybackRequiresUserGesture = false
-            javaScriptCanOpenWindowsAutomatically = true
+            javaScriptCanOpenWindowsAutomatically = false
+            allowFileAccess = false
+            allowContentAccess = false
+            setSupportMultipleWindows(false)
             useWideViewPort = true
             loadWithOverviewMode = true
             setSupportZoom(true)
@@ -328,13 +364,15 @@ class MainActivity : AppCompatActivity() {
             cacheMode = WebSettings.LOAD_DEFAULT
             userAgentString = settings.uaMode.uaString(WebSettings.getDefaultUserAgent(this@MainActivity))
             textZoom = settings.fontScale
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                safeBrowsingEnabled = true
+            }
         }
 
         // 网络 hook + 油猴脚本（document-start）
         if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
             try {
-                val h = WebViewCompat.addDocumentStartJavaScript(wv, NETWORK_HOOK_JS, setOf("*"))
-                scriptHandlers["__net_hook_${System.identityHashCode(wv)}"] = h
+                WebViewCompat.addDocumentStartJavaScript(wv, NETWORK_HOOK_JS, setOf("*"))
             } catch (e: Exception) {
             }
         }
@@ -360,24 +398,24 @@ class MainActivity : AppCompatActivity() {
             }
 
             override fun onReceivedTitle(view: WebView?, title: String?) {
-                lastTitle = title ?: ""
-                tabs.current?.let { t ->
-                    if (t.webView === view) {
-                        t.title = lastTitle
-                        urlInput.setText(t.url)
-                    }
+                val tab = tabs.all.firstOrNull { it.webView === view } ?: return
+                tab.title = title.orEmpty()
+                if (tabs.current === tab) {
+                    urlInput.setText(tab.url)
                 }
             }
         }
 
         wv.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView?, url: String?) {
-                tabs.current?.let { t ->
-                    if (t.webView === view) {
-                        t.url = url ?: ""
-                        settings.addHistory(url ?: "", lastTitle)
-                        urlInput.setText(url ?: "")
-                    }
+                val tab = tabs.all.firstOrNull { it.webView === view }
+                if (tab != null) {
+                    tab.url = url.orEmpty()
+                    tab.title = view?.title.orEmpty().ifEmpty { tab.title }
+                    settings.addHistory(tab.url, tab.title)
+                }
+                if (tab != null && tabs.current === tab) {
+                    urlInput.setText(url.orEmpty())
                 }
                 runOnUiThread { statusBar.text = buildStatusText() }
             }
@@ -386,6 +424,20 @@ class MainActivity : AppCompatActivity() {
                 if (tabs.current?.webView === view) {
                     urlInput.setText(url ?: "")
                 }
+            }
+
+            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                val uri = request?.url ?: return false
+                val scheme = uri.scheme?.lowercase(Locale.ROOT)
+                if (scheme == "http" || scheme == "https" || scheme == "about") return false
+                if (scheme in setOf("mailto", "tel", "sms", "geo")) {
+                    try {
+                        startActivity(Intent(Intent.ACTION_VIEW, uri))
+                    } catch (_: ActivityNotFoundException) {
+                        toast("没有可处理该链接的应用")
+                    }
+                }
+                return true
             }
 
             @Deprecated("Deprecated in Java")
@@ -475,7 +527,7 @@ class MainActivity : AppCompatActivity() {
     // ==================== 主菜单（分组 + 矢量图标） ====================
     private fun showMainMenu() {
         val menuCfg = settings.getMenuConfig()
-        fun enabled(id: String) = menuCfg[id] != false
+        fun enabled(id: String) = id == "menuconfig" || id == "about" || menuCfg[id] != false
         val groups = listOf(
             Pair("📌 页面", listOf(
                 MenuItem("bookmark", R.drawable.ic_bookmark, "书签") { showBookmarks() },
@@ -505,6 +557,7 @@ class MainActivity : AppCompatActivity() {
                 MenuItem("orientation", R.drawable.ic_refresh, "屏幕方向：${orientationLabel()}") { showOrientation() },
                 MenuItem("adblock", R.drawable.ic_close, "广告拦截：${if (settings.adBlock) "开" else "关"}") { toggleAdBlock() },
                 MenuItem("debugweb", R.drawable.ic_code, "允许调试网页：${if (settings.debugWeb) "开" else "关"}") { toggleDebugWeb() },
+                MenuItem("lanapi", R.drawable.ic_link, "局域网 API：${if (settings.lanApiEnabled) "开" else "关"}") { toggleLanApi() },
                 MenuItem("menuconfig", R.drawable.ic_menu, "定制菜单") { showMenuConfig() },
                 MenuItem("history", R.drawable.ic_history, "历史记录") { showHistory() },
                 MenuItem("about", R.drawable.ic_info, "关于 / API") { showAbout() }
@@ -530,11 +583,16 @@ class MainActivity : AppCompatActivity() {
             }
         }
         scroll.addView(col)
-        AlertDialog.Builder(this)
+        val dialog = AlertDialog.Builder(this)
             .setTitle("功能菜单")
             .setView(scroll)
             .setNegativeButton("关闭", null)
-            .show()
+            .create()
+        mainMenuDialog = dialog
+        dialog.setOnDismissListener {
+            if (mainMenuDialog === dialog) mainMenuDialog = null
+        }
+        dialog.show()
     }
 
     private class MenuItem(val id: String, val icon: Int, val label: String, val action: () -> Unit)
@@ -547,15 +605,8 @@ class MainActivity : AppCompatActivity() {
             setBackgroundResource(android.R.drawable.list_selector_background)
             isClickable = true
             setOnClickListener {
+                mainMenuDialog?.dismiss()
                 action()
-                // 关闭对话框：通过标记（findViewWithTag）
-                (parent as? ViewGroup)?.let { p ->
-                    var cur: View? = this
-                    while (cur != null) {
-                        if (cur is ScrollView) break
-                        cur = cur.parent as? View
-                    }
-                }
             }
             addView(ImageView(this@MainActivity).apply {
                 setImageResource(iconRes)
@@ -607,13 +658,14 @@ class MainActivity : AppCompatActivity() {
     private fun addCurrentToBookmarks() {
         val url = currentWeb()?.url ?: return
         if (url.isEmpty()) { toast("当前无页面"); return }
-        val name = lastTitle.ifEmpty { url }
+        val name = tabs.current?.title.orEmpty().ifEmpty { url }
         settings.addBookmark(name, url)
         toast("已收藏：$name")
     }
 
     // ==================== 保存页面 / 分享 / 查找 / 翻译 ====================
     private fun savePage() {
+        if (!ensureLegacyDownloadsPermission()) return
         val wv = currentWeb() ?: return
         val url = wv.url ?: return
         if (url.isEmpty() || url == "about:blank") { toast("当前没有可保存的页面"); return }
@@ -650,9 +702,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun sharePage() {
         val url = currentWeb()?.url ?: return
+        val title = tabs.current?.title.orEmpty().ifEmpty { url }
         val send = Intent(Intent.ACTION_SEND).apply {
             type = "text/plain"
-            putExtra(Intent.EXTRA_TEXT, "${lastTitle.ifEmpty { url }}\n$url")
+            putExtra(Intent.EXTRA_TEXT, "$title\n$url")
         }
         startActivity(Intent.createChooser(send, "分享页面"))
     }
@@ -838,7 +891,7 @@ class MainActivity : AppCompatActivity() {
     // ==================== 添加到桌面 ====================
     private fun addToHome() {
         val url = currentWeb()?.url ?: return
-        val title = lastTitle.ifEmpty { url }
+        val title = tabs.current?.title.orEmpty().ifEmpty { url }
         val id = "bd_${url.hashCode()}"
         val intent = Intent(this, MainActivity::class.java).apply {
             action = Intent.ACTION_VIEW
@@ -860,21 +913,25 @@ class MainActivity : AppCompatActivity() {
 
     // ==================== 开发者工具 ====================
     private fun devTools() {
-        val ip = localIp()
+        val api = apiBaseUrl()
+        val token = settings.apiToken
         val wv = currentWeb()
         AlertDialog.Builder(this)
             .setTitle("开发者工具")
             .setMessage(
-                "HTTP API：http://$ip:8788\n" +
+                "HTTP API：$api\n" +
+                    "访问范围：${if (settings.lanApiEnabled) "局域网 + 本机" else "仅本机"}\n" +
+                    "认证：Bearer ${token.take(6)}…${token.takeLast(4)}\n" +
                     "工具：browser_open/state/console/network/eval/screenshot/perf/report/source/close\n\n" +
                     "当前标签：${wv?.url ?: "无"}\n" +
                     "console 日志：${consoleLogs.size}（错误 ${consoleLogs.filter { it.optString("type") == "error" }.size}）\n\n" +
-                    "提示：其它 AI 工具可通过 HTTP 调用本浏览器诊断与操作页面。"
+                    "提示：HTTP 请求必须携带 Authorization: Bearer <token>。"
             )
             .setPositiveButton("复制 API 地址") { _, _ ->
-                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                cm.setPrimaryClip(ClipData.newPlainText("api", "http://$ip:8788"))
-                toast("已复制 http://$ip:8788")
+                copyText(api)
+            }
+            .setNeutralButton("复制 API Token") { _, _ ->
+                copyText(token)
             }
             .setNegativeButton("关闭", null)
             .show()
@@ -1021,20 +1078,22 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showAbout() {
-        val ip = localIp()
+        val api = apiBaseUrl()
+        val token = settings.apiToken
         val ua = currentWeb()?.settings?.userAgentString ?: ""
         AlertDialog.Builder(this)
             .setTitle("BrowserDiag")
             .setMessage(
-                "版本：3.0.0\n" +
-                    "HTTP API：http://$ip:8788\n" +
+                "版本：3.2.0\n" +
+                    "HTTP API：$api（Token 认证）\n" +
                     "功能：多标签 / 搜索引擎 / UA / 深色主题 / 油猴 / 书签 / 源码打包 / 嗅探 / 二维码 / 语音等\n" +
                     "\n当前 UA：\n${ua.take(120)}"
             )
             .setPositiveButton("复制 API 地址") { _, _ ->
-                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                cm.setPrimaryClip(ClipData.newPlainText("api", "http://$ip:8788"))
-                toast("已复制 http://$ip:8788")
+                copyText(api)
+            }
+            .setNeutralButton("复制 API Token") { _, _ ->
+                copyText(token)
             }
             .setNegativeButton("关闭", null)
             .show()
@@ -1042,6 +1101,7 @@ class MainActivity : AppCompatActivity() {
 
     // ==================== 源码 zip（保留 v2.1） ====================
     private fun downloadSourceZip() {
+        if (!ensureLegacyDownloadsPermission()) return
         val wv = currentWeb() ?: return
         val currentUrl = wv.url ?: ""
         if (currentUrl.isEmpty() || currentUrl == "about:blank") {
@@ -1067,7 +1127,7 @@ class MainActivity : AppCompatActivity() {
                 SourcePacker.pack(
                     context = this,
                     url = currentUrl,
-                    title = lastTitle,
+                    title = tabs.current?.title.orEmpty(),
                     html = html,
                     consoleJson = consoleJson,
                     networkJson = netJson,
@@ -1083,6 +1143,22 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ==================== 油猴规则 / 服务器 ====================
+    private fun ensureLegacyDownloadsPermission(): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) return true
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            return true
+        }
+        ActivityCompat.requestPermissions(
+            this,
+            arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE),
+            LEGACY_STORAGE_PERMISSION_REQUEST
+        )
+        toast("请允许存储权限后重试")
+        return false
+    }
+
     private fun patternToOriginRules(pattern: String): Set<String> {
         val p = pattern.trim()
         if (p.isEmpty() || p == "*") return setOf("*")
@@ -1097,27 +1173,29 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-        // ==================== v3.1 新功能（参考 X 浏览器） ====================
+    // ==================== v3.x 浏览器增强 ====================
 
     /** 全屏模式：隐藏顶栏/状态栏/底栏，沉浸式浏览 */
     private fun toggleFullscreen() {
-        val isFullscreen = bottomBar.visibility != View.VISIBLE
-        if (isFullscreen) {
-            // 退出全屏
+        setFullscreen(!isFullscreen)
+        toast(if (isFullscreen) "已进入全屏（按返回键退出）" else "已退出全屏")
+    }
+
+    private fun setFullscreen(enabled: Boolean) {
+        isFullscreen = enabled
+        if (!enabled) {
             topBar.visibility = View.VISIBLE
             bottomBar.visibility = View.VISIBLE
             statusBar.visibility = View.VISIBLE
             window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
-            toast("已退出全屏")
         } else {
-            // 进入全屏
+            if (findBar.visibility == View.VISIBLE) hideFindBar()
             topBar.visibility = View.GONE
             bottomBar.visibility = View.GONE
             statusBar.visibility = View.GONE
             window.decorView.systemUiVisibility =
                 View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
                 View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-            toast("全屏模式（再点菜单可退出）")
         }
     }
 
@@ -1148,7 +1226,11 @@ class MainActivity : AppCompatActivity() {
     private fun showDownloads() {
         val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
         val q = DownloadManager.Query()
-        q.setFilterByStatus(DownloadManager.STATUS_SUCCESSFUL or DownloadManager.STATUS_PAUSED or DownloadManager.STATUS_RUNNING or DownloadManager.STATUS_PENDING)
+        q.setFilterByStatus(
+            DownloadManager.STATUS_SUCCESSFUL or DownloadManager.STATUS_PAUSED or
+                DownloadManager.STATUS_RUNNING or DownloadManager.STATUS_PENDING or
+                DownloadManager.STATUS_FAILED
+        )
         val cursor: Cursor? = try { dm.query(q) } catch (e: Exception) { null }
         if (cursor == null || !cursor.moveToFirst()) {
             cursor?.close()
@@ -1156,21 +1238,42 @@ class MainActivity : AppCompatActivity() {
             return
         }
         val names = mutableListOf<String>()
-        val uris = mutableListOf<Uri>()
+        val ids = mutableListOf<Long>()
         do {
+            val id = cursor.getLong(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_ID))
             val title = cursor.getString(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_TITLE))
-            val uri = cursor.getString(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_LOCAL_URI))
             val size = cursor.getLong(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES))
-            names.add("$title  (${size / 1024}KB)")
-            uris.add(Uri.parse(uri ?: ""))
+            val status = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+            val state = when (status) {
+                DownloadManager.STATUS_SUCCESSFUL -> "完成"
+                DownloadManager.STATUS_FAILED -> "失败"
+                DownloadManager.STATUS_PAUSED -> "暂停"
+                DownloadManager.STATUS_RUNNING -> "下载中"
+                else -> "等待"
+            }
+            val sizeText = if (size > 0) " · ${size / 1024}KB" else ""
+            names.add("$state · $title$sizeText")
+            ids.add(id)
         } while (cursor.moveToNext())
         cursor.close()
         AlertDialog.Builder(this)
             .setTitle("下载管理（${names.size} 个）")
             .setItems(names.toTypedArray()) { _, idx ->
+                val uri = dm.getUriForDownloadedFile(ids[idx])
+                if (uri == null) {
+                    toast("该下载尚不可打开")
+                    return@setItems
+                }
                 try {
-                    startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uris[idx], "*/*").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
-                } catch (e: ActivityNotFoundException) {
+                    val mime = dm.getMimeTypeForDownloadedFile(ids[idx]) ?: "*/*"
+                    startActivity(
+                        Intent(Intent.ACTION_VIEW)
+                            .setDataAndType(uri, mime)
+                            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    )
+                } catch (_: ActivityNotFoundException) {
+                    toast("无法打开该文件")
+                } catch (_: SecurityException) {
                     toast("无法打开该文件")
                 }
             }
@@ -1191,6 +1294,16 @@ class MainActivity : AppCompatActivity() {
         settings.debugWeb = !settings.debugWeb
         WebView.setWebContentsDebuggingEnabled(settings.debugWeb)
         toast(if (settings.debugWeb) "已开启 WebView 远程调试（chrome://inspect 可连接）" else "已关闭远程调试")
+    }
+
+    /** 默认仅本机访问；显式开启后才监听局域网地址，仍必须携带 API Token。 */
+    private fun toggleLanApi() {
+        settings.lanApiEnabled = !settings.lanApiEnabled
+        restartServer()
+        toast(
+            if (settings.lanApiEnabled) "局域网 API 已开启（Token 认证仍然有效）"
+            else "局域网 API 已关闭，仅本机可访问"
+        )
     }
 
     /** 字体大小调节（50%-200%，textZoom 持久化） */
@@ -1251,12 +1364,12 @@ class MainActivity : AppCompatActivity() {
             "devtools" to "开发者工具", "dark" to "深色主题", "engine" to "搜索引擎",
             "ua" to "UA 切换", "userscript" to "油猴脚本", "font" to "字体大小",
             "orientation" to "屏幕方向", "adblock" to "广告拦截", "debugweb" to "允许调试网页",
-            "menuconfig" to "定制菜单", "history" to "历史记录", "about" to "关于"
+            "lanapi" to "局域网 API", "history" to "历史记录"
         )
         val cfg = settings.getMenuConfig().toMutableMap()
         val scroll = ScrollView(this)
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        allItems.forEachIndexed { i, (id, label) ->
+        allItems.forEach { (id, label) ->
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
@@ -1273,7 +1386,7 @@ class MainActivity : AppCompatActivity() {
         }
         scroll.addView(col)
         AlertDialog.Builder(this)
-            .setTitle("定制菜单（勾选显示）")
+            .setTitle("定制菜单（关于与本项始终显示）")
             .setView(scroll)
             .setPositiveButton("保存") { _, _ -> settings.setMenuConfig(cfg); toast("菜单已更新") }
             .setNegativeButton("取消", null)
@@ -1286,21 +1399,31 @@ class MainActivity : AppCompatActivity() {
         toast("已复制")
     }
 
+    private fun restartServer() {
+        server?.stop()
+        server = null
+        startServer()
+    }
+
     private fun startServer() {
+        val listenHost = if (settings.lanApiEnabled) "0.0.0.0" else "127.0.0.1"
         var port = 8788
         var started = false
         while (port < 8792) {
             try {
                 val s = DiagServer(
+                    listenHost,
                     port,
                     applicationContext,
                     { tabs.current?.webView },
                     { synchronized(consoleLogs) { consoleLogs.toList() } },
                     { settings },
-                    { tabs }
+                    { tabs },
+                    settings.apiToken
                 )
-                s.start(500, true)
+                s.start(5000, true)
                 server = s
+                serverPort = port
                 started = true
                 break
             } catch (e: Exception) {
@@ -1312,6 +1435,11 @@ class MainActivity : AppCompatActivity() {
         } else {
             statusBar.text = buildStatusText()
         }
+    }
+
+    private fun apiBaseUrl(): String {
+        val host = if (settings.lanApiEnabled) localIp() else "127.0.0.1"
+        return "http://$host:$serverPort"
     }
 
     private fun localIp(): String {
@@ -1339,6 +1467,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onBackPressed() {
+        if (isFullscreen) {
+            setFullscreen(false)
+            return
+        }
         if (findBar.visibility == View.VISIBLE) {
             hideFindBar()
             return
@@ -1348,6 +1480,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     companion object {
+        private const val LEGACY_STORAGE_PERMISSION_REQUEST = 4101
+
         /** 广告拦截域名黑名单（子域名自动匹配） */
         private val AD_BLOCK_HOSTS = listOf(
             "doubleclick.net", "googlesyndication.com", "googleadservices.com",
@@ -1365,6 +1499,7 @@ class MainActivity : AppCompatActivity() {
               window.__bdHooked = true;
               window.__bdNet = [];
               function record(u,m,s,t){ window.__bdNet.push({url:String(u).slice(0,300),method:m,status:s,type:t}); if(window.__bdNet.length>300) window.__bdNet.shift(); }
+              function urlOf(u){ if(typeof u==='string')return u;if(u&&u.url)return u.url;if(u&&u.href)return u.href;return String(u); }
               var op = XMLHttpRequest.prototype.open;
               var sp = XMLHttpRequest.prototype.send;
               XMLHttpRequest.prototype.open = function(m,u){ this.__u=u; this.__m=m; return op.apply(this,arguments); };
@@ -1376,8 +1511,10 @@ class MainActivity : AppCompatActivity() {
               var of = window.fetch;
               window.fetch = function(){
                 var u = arguments[0];
-                return of.apply(this,arguments).then(function(r){ record(typeof u==='string'?u:u.url,'fetch',r.status,'fetch'); return r; })
-                  .catch(function(e){ record(typeof u==='string'?u:u.url,'fetch',0,'fetch'); throw e; });
+                var init = arguments[1] || {};
+                var method = String(init.method || (u && u.method) || 'GET').toUpperCase();
+                return of.apply(this,arguments).then(function(r){ record(urlOf(u),method,r.status,'fetch'); return r; })
+                  .catch(function(e){ record(urlOf(u),method,0,'fetch'); throw e; });
               };
             })();
         """.trimIndent()
