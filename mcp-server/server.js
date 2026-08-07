@@ -18,10 +18,127 @@ import { z } from 'zod';
 import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
+import os from 'node:os';
+import crypto from 'node:crypto';
+import { pathToFileURL } from 'node:url';
 
 const MAX_LOG = 800;
+const MAX_HTTP_BODY_BYTES = 256 * 1024;
+const DEFAULT_HTTP_PORT = 8788;
+const DEFAULT_HTTP_HOST = '127.0.0.1';
 
-class BrowserDiag {
+export function clampInt(value, fallback, min, max) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
+}
+
+export function normalizeHttpUrl(value) {
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new Error('url is required');
+  }
+  let target;
+  try {
+    target = new URL(value.trim());
+  } catch {
+    throw new Error('invalid url');
+  }
+  if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+    throw new Error('only http(s) urls are allowed');
+  }
+  return target.href;
+}
+
+export function parseHttpOptions(args = [], env = process.env) {
+  const parsePort = (value, fallback) => {
+    if (value === undefined || value === null || value === '') return fallback;
+    const parsed = Number(value);
+    return Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535 ? parsed : NaN;
+  };
+  let host = env.BROWSERDIAG_HOST || DEFAULT_HTTP_HOST;
+  let port = parsePort(env.BROWSERDIAG_PORT, DEFAULT_HTTP_PORT);
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--port') {
+      port = parsePort(args[++i], NaN);
+    } else if (arg === '--host') {
+      host = String(args[++i] || '').trim();
+    } else if (/^\d+$/.test(arg) && i === 0) {
+      port = parsePort(arg, NaN);
+    } else {
+      throw new Error('unknown HTTP option: ' + arg);
+    }
+  }
+  if (!Number.isFinite(port)) throw new Error('invalid HTTP port');
+  if (!host) throw new Error('invalid HTTP host');
+  return { host, port };
+}
+
+export function isAuthorized(headers, token) {
+  if (!token) return false;
+  const authorization = String(headers?.authorization || '');
+  const bearer = /^Bearer\s+(.+)$/i.exec(authorization)?.[1]?.trim();
+  const direct = String(headers?.['x-browserdiag-token'] || '').trim();
+  const candidate = bearer || direct;
+  if (!candidate) return false;
+  const expectedBytes = Buffer.from(token);
+  const candidateBytes = Buffer.from(candidate);
+  return expectedBytes.length === candidateBytes.length &&
+    crypto.timingSafeEqual(expectedBytes, candidateBytes);
+}
+
+function isExecutable(file) {
+  if (!file) return false;
+  try {
+    fs.accessSync(file, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function resolveBrowserExecutable(env = process.env) {
+  const explicit = env.BROWSERDIAG_CHROME || env.CHROME_PATH;
+  if (explicit) {
+    if (!isExecutable(explicit)) {
+      throw new Error('configured Chromium executable is not accessible: ' + explicit);
+    }
+    return explicit;
+  }
+
+  const candidates = process.platform === 'win32'
+    ? [
+        path.join(env.PROGRAMFILES || '', 'Google/Chrome/Application/chrome.exe'),
+        path.join(env['PROGRAMFILES(X86)'] || '', 'Google/Chrome/Application/chrome.exe'),
+      ]
+    : process.platform === 'darwin'
+      ? ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome']
+      : ['/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium', '/usr/bin/chromium-browser'];
+  for (const candidate of candidates) {
+    if (isExecutable(candidate)) return candidate;
+  }
+
+  const cacheRoot = env.PLAYWRIGHT_BROWSERS_PATH && env.PLAYWRIGHT_BROWSERS_PATH !== '0'
+    ? env.PLAYWRIGHT_BROWSERS_PATH
+    : path.join(os.homedir(), '.cache', 'ms-playwright');
+  try {
+    const dirs = fs.readdirSync(cacheRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && /^chromium-\d+$/.test(entry.name))
+      .map((entry) => entry.name)
+      .sort((a, b) => Number(b.split('-')[1]) - Number(a.split('-')[1]));
+    for (const dir of dirs) {
+      for (const suffix of ['chrome-linux/chrome', 'chrome-linux64/chrome']) {
+        const candidate = path.join(cacheRoot, dir, suffix);
+        if (isExecutable(candidate)) return candidate;
+      }
+    }
+  } catch {
+    // Playwright's default executable resolution gets the final chance below.
+  }
+  return null;
+}
+
+export class BrowserDiag {
   constructor() {
     this.browser = null;
     this.page = null;
@@ -29,35 +146,46 @@ class BrowserDiag {
     this.networkLogs = [];   // {ts,url,method,status,failed,errorText,resourceType}
     this.pageErrors = [];
     this.context = null;
+    this.mobileMode = null;
   }
 
-  async _ensurePage({ mobile = false } = {}) {
+  async _ensurePage({ mobile } = {}) {
     if (!this.browser) {
-      // 使用完整版 Chromium（headless_shell 无 GPU/WebGL 支持，Flutter Web
-      // 渲染会报大量 shader 错误）；SwiftShader 软件渲染 WebGL。
-      const candidates = [
-        '/root/.cache/ms-playwright/chromium-1234/chrome-linux/chrome',
-        '/root/.cache/ms-playwright/chromium_headless_shell-1234/chrome-linux/headless_shell',
+      const executablePath = resolveBrowserExecutable();
+      const launchArgs = [
+        '--disable-dev-shm-usage',
+        '--autoplay-policy=no-user-gesture-required',
+        '--lang=zh-CN',
+        '--use-gl=angle',
+        '--use-angle=swiftshader',
+        '--enable-unsafe-swiftshader',
+        '--disable-blink-features=AutomationControlled',
       ];
-      let executablePath = candidates[0];
-      try { fs.accessSync(executablePath); } catch { executablePath = candidates[1]; }
-      this.browser = await chromium.launch({
-        executablePath,
+      if (typeof process.getuid === 'function' && process.getuid() === 0) {
+        launchArgs.unshift('--no-sandbox');
+      }
+      const launchOptions = {
         headless: true,
-        args: [
-          '--no-sandbox',
-          '--disable-dev-shm-usage',
-          '--autoplay-policy=no-user-gesture-required',
-          '--lang=zh-CN',
-          '--use-gl=angle',
-          '--use-angle=swiftshader',
-          '--enable-unsafe-swiftshader',
-          '--disable-blink-features=AutomationControlled',
-        ],
-      });
+        args: launchArgs,
+        ...(executablePath ? { executablePath } : {}),
+      };
+      try {
+        this.browser = await chromium.launch(launchOptions);
+      } catch (error) {
+        throw new Error(
+          'Chromium launch failed. Run "npx playwright-core install chromium" or set BROWSERDIAG_CHROME. ' +
+          String(error?.message || error)
+        );
+      }
+    }
+    const desiredMobile = mobile === undefined ? (this.mobileMode ?? false) : !!mobile;
+    if (this.context && this.mobileMode !== desiredMobile) {
+      await this.context.close();
+      this.context = null;
+      this.page = null;
     }
     if (!this.context) {
-      const isMobile = !!mobile;
+      const isMobile = desiredMobile;
       this.context = await this.browser.newContext({
         locale: 'zh-CN',
         timezoneId: 'Asia/Shanghai',
@@ -75,6 +203,7 @@ class BrowserDiag {
               userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
             }),
       });
+      this.mobileMode = isMobile;
       this.page = await this.context.newPage();
       // ---- 日志采集 ----
       this.page.on('console', (msg) => {
@@ -108,18 +237,20 @@ class BrowserDiag {
   }
 
   async open({ url, mobile = false, waitMs = 8000 }) {
+    const targetUrl = normalizeHttpUrl(url);
     const page = await this._ensurePage({ mobile });
+    const settleMs = clampInt(waitMs, 8000, 0, 15000);
     // 导航前清空日志，保证当前页面日志独立
     this.consoleLogs = [];
     this.networkLogs = [];
     this.pageErrors = [];
     let navErr = null;
     try {
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
     } catch (e) {
       navErr = e.message.split('\n')[0];
     }
-    await page.waitForTimeout(Math.min(waitMs, 15000));
+    if (settleMs > 0) await page.waitForTimeout(settleMs);
     const state = await page.evaluate(() => ({
       title: document.title,
       url: location.href,
@@ -153,6 +284,7 @@ class BrowserDiag {
   }
 
   async console({ type = '', limit = 50 } = {}) {
+    limit = clampInt(limit, 50, 1, 500);
     let list = this.consoleLogs;
     if (type) list = list.filter((l) => l.type === type);
     const shown = list.slice(-limit).reverse();
@@ -161,6 +293,7 @@ class BrowserDiag {
   }
 
   async network({ onlyFailed = false, limit = 100 } = {}) {
+    limit = clampInt(limit, 100, 1, 500);
     let list = this.networkLogs;
     if (onlyFailed) list = list.filter((n) => n.failed || n.status >= 400);
     const shown = list.slice(-limit).reverse();
@@ -175,10 +308,12 @@ class BrowserDiag {
 
   async click({ selector, text = '', timeout = 10000 }) {
     const page = await this._ensurePage();
+    timeout = clampInt(timeout, 10000, 100, 60000);
     if (text) {
       await page.getByText(text, { exact: false }).first().click({ timeout });
       return { clicked: `text="${text}"` };
     }
+    if (!selector) throw new Error('selector or text is required');
     await page.click(selector, { timeout });
     await page.waitForTimeout(800);
     return { clicked: selector };
@@ -203,6 +338,7 @@ class BrowserDiag {
     if (key) {
       await page.keyboard.press(key);
     } else {
+      if (typeof text !== 'string') throw new Error('text or key is required');
       await page.keyboard.type(text, { delay: 60 });
     }
     return { typed: text || key };
@@ -221,6 +357,7 @@ class BrowserDiag {
 
   async wait({ selector = '', timeout = 10000 }) {
     const page = await this._ensurePage();
+    timeout = clampInt(timeout, 10000, 0, 60000);
     if (selector) {
       await page.waitForSelector(selector, { timeout });
       return { waited: `selector ${selector} appeared` };
@@ -229,7 +366,7 @@ class BrowserDiag {
     return { waited: `${timeout}ms` };
   }
 
-  async screenshot({ path: p = '/root/browser-diag-shots/shot.png', fullPage = false } = {}) {
+  async screenshot({ path: p = path.join(process.cwd(), 'browser-diag-shots', 'shot.png'), fullPage = false } = {}) {
     const page = await this._ensurePage();
     fs.mkdirSync(path.dirname(p), { recursive: true });
     await page.screenshot({ path: p, fullPage });
@@ -239,12 +376,26 @@ class BrowserDiag {
 
   async save({ url, path: p, headers = '' } = {}) {
     const page = await this._ensurePage();
+    const targetUrl = normalizeHttpUrl(url);
+    if (!p || typeof p !== 'string') throw new Error('path is required');
     fs.mkdirSync(path.dirname(p), { recursive: true });
     const h = headers ? JSON.parse(headers) : {};
-    const res = await page.request.get(url, { headers: h, timeout: 60000 });
+    const res = await page.request.get(targetUrl, { headers: h, timeout: 60000 });
     const buf = await res.body();
     fs.writeFileSync(p, buf);
-    return { url, path: p, bytes: buf.length, status: res.status() };
+    return { url: targetUrl, path: p, bytes: buf.length, status: res.status() };
+  }
+
+  async source({ maxLen = 500000 } = {}) {
+    const page = await this._ensurePage();
+    const safeMaxLen = clampInt(maxLen, 500000, 1, 2000000);
+    const html = await page.content();
+    return {
+      url: page.url(),
+      htmlLength: html.length,
+      truncated: html.length > safeMaxLen,
+      html: html.slice(0, safeMaxLen),
+    };
   }
 
   async perf() {
@@ -363,9 +514,14 @@ class BrowserDiag {
   }
 
   async resize({ width, height }) {
-    if (!this.context) await this._ensurePage();
-    await this.context.setViewportSize({ width, height });
-    return { viewport: { width, height } };
+    const page = await this._ensurePage();
+    const safeWidth = clampInt(width, NaN, 200, 7680);
+    const safeHeight = clampInt(height, NaN, 200, 4320);
+    if (!Number.isFinite(safeWidth) || !Number.isFinite(safeHeight)) {
+      throw new Error('valid width and height are required');
+    }
+    await page.setViewportSize({ width: safeWidth, height: safeHeight });
+    return { viewport: { width: safeWidth, height: safeHeight } };
   }
 
   async nav({ action }) {
@@ -380,6 +536,7 @@ class BrowserDiag {
 
   async dom({ selector, attr = 'outerHTML', limit = 5 }) {
     const page = await this._ensurePage();
+    limit = clampInt(limit, 5, 1, 200);
     const r = await page.evaluate(({ sel, at, lim }) => {
       const els = [...document.querySelectorAll(sel)].slice(0, lim);
       return els.map((el) => {
@@ -467,6 +624,7 @@ class BrowserDiag {
       await page.unrouteAll();
       return { unregistered: true };
     }
+    status = clampInt(status, 200, 100, 599);
     for (const p of patterns) {
       await page.route(p, (route) => {
         if (mock) route.fulfill({ status, contentType: 'application/json', body: mock });
@@ -480,6 +638,7 @@ class BrowserDiag {
     if (this.browser) {
       await this.browser.close();
       this.browser = null; this.context = null; this.page = null;
+      this.mobileMode = null;
       this.consoleLogs = []; this.networkLogs = []; this.pageErrors = [];
     }
     return { closed: true };
@@ -490,6 +649,7 @@ class BrowserDiag {
   /** 提取页面正文文本（mcp-chrome: chrome_get_web_content） */
   async text({ maxLen = 20000 } = {}) {
     const page = await this._ensurePage();
+    maxLen = clampInt(maxLen, 20000, 1, 100000);
     const r = await page.evaluate((ml) => {
       const a = document.querySelector('article') || document.body;
       const t = (a ? a.innerText : '').replace(/\n{3,}/g, '\n\n');
@@ -501,6 +661,7 @@ class BrowserDiag {
   /** 查找可点击元素（mcp-chrome: chrome_get_interactive_elements） */
   async interactive({ limit = 50 } = {}) {
     const page = await this._ensurePage();
+    limit = clampInt(limit, 50, 1, 500);
     const r = await page.evaluate((lim) => {
       const els = Array.from(document.querySelectorAll('a[href],button,input,select,textarea,[role=button],[onclick],[tabindex]'))
         .filter((e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; })
@@ -526,10 +687,19 @@ class BrowserDiag {
   /** 自定义 HTTP GET 请求（mcp-chrome: chrome_network_request） */
   async http({ url, headers = '', timeoutMs = 10000 }) {
     const page = await this._ensurePage();
+    const targetUrl = normalizeHttpUrl(url);
     const h = headers ? JSON.parse(headers) : {};
-    const res = await page.request.get(url, { headers: h, timeout: timeoutMs });
+    const timeout = clampInt(timeoutMs, 10000, 1000, 60000);
+    const res = await page.request.get(targetUrl, { headers: h, timeout });
     const body = await res.text();
-    return { status: res.status(), url, bodyLength: body.length, body: body.slice(0, 50000), headers: res.headers() };
+    return {
+      status: res.status(),
+      url: targetUrl,
+      bodyLength: body.length,
+      truncated: body.length > 100000,
+      body: body.slice(0, 100000),
+      headers: res.headers(),
+    };
   }
 }
 
@@ -600,6 +770,11 @@ const toolDefs = {
     desc: '下载 URL 内容到本地文件（验证部署产物、对比字节数等）',
     schema: { url: z.string(), path: z.string(), headers: z.string().optional() },
     run: (p) => diag.save(p),
+  },
+  browser_source: {
+    desc: '提取当前页面 HTML 源码（带长度与截断标记）',
+    schema: { maxLen: z.number().optional() },
+    run: (p) => diag.source(p),
   },
   browser_close: {
     desc: '关闭浏览器（清空日志）',
@@ -674,20 +849,23 @@ const toolDefs = {
 };
 
 // ---------- MCP 模式 ----------
-function startMcp() {
-  const server = new McpServer({ name: 'browser-diag', version: '2.0.0' });
+async function startMcp() {
+  const server = new McpServer({ name: 'browser-diag', version: '3.2.0' });
   for (const [name, def] of Object.entries(toolDefs)) {
     server.tool(name, def.desc, def.schema, async (params) => {
       try {
         const r = await def.run(params || {});
         return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }] };
       } catch (e) {
-        return { content: [{ type: 'text', text: 'ERROR: ' + (e.message || e) }] };
+        return {
+          isError: true,
+          content: [{ type: 'text', text: 'ERROR: ' + (e.message || e) }],
+        };
       }
     });
   }
   const transport = new StdioServerTransport();
-  server.connect(transport);
+  await server.connect(transport);
   console.error('[browser-diag] MCP stdio server started');
 }
 
@@ -695,7 +873,8 @@ function startMcp() {
 async function cli(tool, jsonParams) {
   const def = toolDefs[tool];
   if (!def) {
-    console.log('unknown tool. available: ' + Object.keys(toolDefs).join(', '));
+    console.error('unknown tool. available: ' + Object.keys(toolDefs).join(', '));
+    process.exitCode = 2;
     return;
   }
   try {
@@ -703,48 +882,139 @@ async function cli(tool, jsonParams) {
     const r = await def.run(params);
     console.log(JSON.stringify(r, null, 2));
   } catch (e) {
-    console.log('ERROR: ' + (e.message || e));
+    console.error('ERROR: ' + (e.message || e));
+    process.exitCode = 1;
   }
   await diag.close().catch(() => {});
-  process.exit(0);
 }
 
 // ---------- HTTP 常驻模式 ----------
-function startHttp(port) {
-  const server = http.createServer(async (req, res) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
-    let body = '';
-    req.on('data', (c) => (body += c));
-    req.on('end', async () => {
-      const url = new URL(req.url, 'http://localhost');
-      const tool = url.pathname.replace(/^\/api\//, '');
-      let params = {};
-      try { params = body ? JSON.parse(body) : Object.fromEntries(url.searchParams); } catch { params = {}; }
-      const def = toolDefs[tool];
-      if (!def) {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'unknown tool: ' + tool, available: Object.keys(toolDefs) }));
-        return;
-      }
-      try {
-        const r = await def.run(params);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(r));
-      } catch (e) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: e.message || String(e) }));
-      }
-    });
-  });
-  server.listen(port, () => console.error(`[browser-diag] HTTP server on :${port}`));
+async function readRequestBody(req) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += buffer.length;
+    if (size > MAX_HTTP_BODY_BYTES) {
+      const error = new Error('request body too large');
+      error.statusCode = 413;
+      throw error;
+    }
+    chunks.push(buffer);
+  }
+  return Buffer.concat(chunks).toString('utf8');
 }
 
-const args = process.argv.slice(2);
-if (args[0] === '--cli') {
-  cli(args[1], args[2]);
-} else if (args[0] === '--http') {
-  startHttp(parseInt(args[1] || "8788", 10));
-} else {
-  startMcp();
+function sendJson(res, status, value, corsOrigin = '') {
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  if (corsOrigin) res.setHeader('Access-Control-Allow-Origin', corsOrigin);
+  res.writeHead(status);
+  res.end(JSON.stringify(value));
+}
+
+export function startHttp({
+  port = DEFAULT_HTTP_PORT,
+  host = DEFAULT_HTTP_HOST,
+  token = process.env.BROWSERDIAG_TOKEN || '',
+  corsOrigin = process.env.BROWSERDIAG_CORS_ORIGIN || '',
+} = {}) {
+  const generatedToken = !token;
+  const authToken = token || crypto.randomBytes(24).toString('base64url');
+  if (authToken.length < 16) throw new Error('BROWSERDIAG_TOKEN must be at least 16 characters');
+
+  const server = http.createServer(async (req, res) => {
+    if (req.method === 'OPTIONS') {
+      if (corsOrigin) {
+        res.setHeader('Access-Control-Allow-Origin', corsOrigin);
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-BrowserDiag-Token');
+      }
+      res.writeHead(204, { 'Cache-Control': 'no-store' });
+      res.end();
+      return;
+    }
+    if (req.method !== 'GET' && req.method !== 'POST') {
+      sendJson(res, 405, { error: 'method not allowed' }, corsOrigin);
+      return;
+    }
+    if (!isAuthorized(req.headers, authToken)) {
+      sendJson(res, 401, { error: 'unauthorized' }, corsOrigin);
+      return;
+    }
+
+    const requestUrl = new URL(req.url || '/', 'http://localhost');
+    const match = /^\/api\/([a-z0-9_]+)$/.exec(requestUrl.pathname);
+    const tool = match?.[1] || '';
+    const def = toolDefs[tool];
+    if (!def) {
+      sendJson(
+        res,
+        404,
+        { error: 'unknown tool: ' + tool, available: Object.keys(toolDefs) },
+        corsOrigin
+      );
+      return;
+    }
+
+    let params = Object.fromEntries(requestUrl.searchParams);
+    if (req.method === 'POST') {
+      try {
+        const body = await readRequestBody(req);
+        if (body) {
+          const parsed = JSON.parse(body);
+          if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
+            throw new Error('JSON body must be an object');
+          }
+          params = { ...params, ...parsed };
+        }
+      } catch (error) {
+        sendJson(res, error?.statusCode || 400, { error: error?.message || 'invalid request' }, corsOrigin);
+        return;
+      }
+    }
+
+    try {
+      const result = await def.run(params);
+      sendJson(res, 200, result, corsOrigin);
+    } catch (error) {
+      sendJson(res, 500, { error: error?.message || String(error) }, corsOrigin);
+    }
+  });
+
+  server.requestTimeout = 70000;
+  server.headersTimeout = 10000;
+  server.listen(port, host, () => {
+    const address = server.address();
+    const actualPort = typeof address === 'object' && address ? address.port : port;
+    console.error('[browser-diag] HTTP server on http://' + host + ':' + actualPort);
+    if (generatedToken) {
+      console.error('[browser-diag] generated API token: ' + authToken);
+    }
+  });
+  return { server, token: authToken };
+}
+
+export async function main(args = process.argv.slice(2)) {
+  if (args[0] === '--cli') {
+    await cli(args[1], args[2]);
+  } else if (args[0] === '--http') {
+    const options = parseHttpOptions(args.slice(1));
+    startHttp(options);
+  } else if (!args[0]) {
+    await startMcp();
+  } else {
+    throw new Error('usage: server.js [--cli <tool> <json> | --http [port] [--host host] [--port port]]');
+  }
+}
+
+const entryUrl = process.argv[1] ? pathToFileURL(path.resolve(process.argv[1])).href : '';
+if (import.meta.url === entryUrl) {
+  try {
+    await main();
+  } catch (error) {
+    console.error('ERROR: ' + (error?.message || error));
+    process.exitCode = 1;
+  }
 }
