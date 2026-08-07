@@ -18,10 +18,11 @@ import java.util.concurrent.TimeUnit
  * 其它 AI 工具（不支持安装插件）可通过 HTTP 直接调用本 APK 内的浏览器。
  */
 class DiagServer(
+    private val port: Int,
     private val context: Context,
     private val getWebView: () -> WebView?,
     private val getConsoleLogs: () -> List<JSONObject>,
-) : NanoHTTPD(8788) {
+) : NanoHTTPD(port) {
 
     override fun serve(session: IHTTPSession): Response {
         if (session.method == Method.OPTIONS) {

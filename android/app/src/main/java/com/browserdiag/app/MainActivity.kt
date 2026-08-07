@@ -1,7 +1,11 @@
 package com.browserdiag.app
 
 import android.annotation.SuppressLint
+import android.content.ContentValues
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
 import android.text.InputType
 import android.view.ViewGroup
 import android.webkit.ConsoleMessage
@@ -16,6 +20,9 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import org.json.JSONObject
+import java.io.File
+import java.io.PrintWriter
+import java.io.StringWriter
 import java.net.Inet4Address
 import java.net.NetworkInterface
 
@@ -31,12 +38,45 @@ class MainActivity : AppCompatActivity() {
     private val consoleLogs = mutableListOf<JSONObject>()
     private var server: DiagServer? = null
 
-    @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
+        installCrashHandler()
         super.onCreate(savedInstanceState)
         buildUi()
         setupWebView()
         startServer()
+    }
+
+    /** 全局崩溃捕获：把堆栈写入「下载」目录与内部存储，便于用户反馈 */
+    private fun installCrashHandler() {
+        Thread.setDefaultUncaughtExceptionHandler { _, e ->
+            val sw = StringWriter()
+            e.printStackTrace(PrintWriter(sw))
+            val text = "BrowserDiag crash @ ${System.currentTimeMillis()}\n$sw"
+            try {
+                if (Build.VERSION.SDK_INT >= 29) {
+                    val values = ContentValues().apply {
+                        put(MediaStore.MediaColumns.DISPLAY_NAME, "browserdiag_crash.txt")
+                        put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+                        put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                    }
+                    val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    uri?.let { contentResolver.openOutputStream(it)?.use { os -> os.write(text.toByteArray()) } }
+                } else {
+                    val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                    dir.mkdirs()
+                    File(dir, "browserdiag_crash.txt").writeText(text)
+                }
+            } catch (ex: Exception) {
+                // ignore
+            }
+            try {
+                File(filesDir, "crash.log").writeText(text)
+            } catch (ex: Exception) {
+                // ignore
+            }
+            android.os.Process.killProcess(android.os.Process.myPid())
+            System.exit(2)
+        }
     }
 
     private fun buildUi() {
@@ -79,17 +119,23 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(toolbar)
 
-        webView = WebView(this)
-        webView.layoutParams = LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
-        )
-        root.addView(webView)
-
         statusBar = TextView(this).apply {
             text = "启动中…"
             setPadding(12, 8, 12, 8)
         }
         root.addView(statusBar)
+
+        webView = try {
+            WebView(this)
+        } catch (e: Exception) {
+            statusBar.text = "WebView 初始化失败: ${e.message}"
+            // 用空 WebView 占位，避免启动崩溃
+            WebView(this).apply { setBackgroundColor(android.graphics.Color.DKGRAY) }
+        }
+        webView.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
+        )
+        root.addView(webView)
 
         setContentView(root)
     }
@@ -176,13 +222,29 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startServer() {
-        server = DiagServer(
-            applicationContext,
-            { if (::webView.isInitialized) webView else null },
-            { synchronized(consoleLogs) { consoleLogs.toList() } }
-        )
-        server?.start(500, true)
-        updateStatus()
+        var port = 8788
+        var started = false
+        while (port < 8792) {
+            try {
+                val s = DiagServer(
+                    port,
+                    applicationContext,
+                    { if (::webView.isInitialized) webView else null },
+                    { synchronized(consoleLogs) { consoleLogs.toList() } }
+                )
+                s.start(500, true)
+                server = s
+                started = true
+                break
+            } catch (e: Exception) {
+                port++
+            }
+        }
+        if (!started) {
+            statusBar.text = "API 服务启动失败（端口 8788-8791 均被占用）"
+        } else {
+            updateStatus()
+        }
     }
 
     private fun updateStatus() {
