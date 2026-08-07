@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.BrowserDiag" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">#8AB4F8</item>
+        <item name="colorOnPrimary">#062E6F</item>
+        <item name="colorSecondary">#8AB4F8</item>
+        <item name="colorSurface">#202124</item>
+        <item name="colorOnSurface">#E8EAED</item>
+        <item name="colorSurfaceVariant">#303134</item>
+        <item name="colorOnSurfaceVariant">#BDC1C6</item>
+        <item name="android:statusBarColor">#202124</item>
+        <item name="android:navigationBarColor">#292A2D</item>
+        <item name="android:windowBackground">#202124</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#8AB4F8</item>
+    </style>
+</resources>
