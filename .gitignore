@@ -1,0 +1,15 @@
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.apk
+*.keystore
+
+# Node
+mcp-server/node_modules/
+mcp-server/*.log
+
+# Misc
+.DS_Store
+*.bak
