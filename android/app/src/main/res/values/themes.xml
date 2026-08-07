@@ -16,7 +16,7 @@
         <item name="android:colorAccent">#0B57D0</item>
     </style>
 
-    <style name="ThemeOverlay.BrowserDiag.Light">
+    <style name="ThemeOverlay.BrowserDiag.Light" parent="">
         <item name="colorPrimary">#0B57D0</item>
         <item name="colorOnPrimary">#FFFFFF</item>
         <item name="colorSurface">#F8FAFD</item>
@@ -28,7 +28,7 @@
         <item name="android:colorAccent">#0B57D0</item>
     </style>
 
-    <style name="ThemeOverlay.BrowserDiag.Dark">
+    <style name="ThemeOverlay.BrowserDiag.Dark" parent="">
         <item name="colorPrimary">#8AB4F8</item>
         <item name="colorOnPrimary">#062E6F</item>
         <item name="colorSurface">#202124</item>
