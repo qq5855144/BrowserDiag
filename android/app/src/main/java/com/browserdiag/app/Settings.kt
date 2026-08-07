@@ -2,8 +2,10 @@ package com.browserdiag.app
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
+import java.security.SecureRandom
 
 /** 搜索引擎定义 */
 enum class SearchEngine(val label: String, val searchUrl: String, val homeUrl: String) {
@@ -94,7 +96,7 @@ class Settings(private val ctx: Context) {
     fun addBookmark(name: String, url: String) {
         val list = getBookmarks().toMutableList()
         list.removeAll { it.second == url }
-        list.add(0, name to url)
+        list.add(0, name.take(512) to url.take(4096))
         if (list.size > 100) list.subList(100, list.size).clear()
         saveBookmarks(list)
     }
@@ -132,7 +134,15 @@ class Settings(private val ctx: Context) {
 
     fun saveScripts(scripts: List<Userscript>) {
         val arr = JSONArray()
-        scripts.forEach { arr.put(it.toJson()) }
+        scripts.take(50).forEach { script ->
+            arr.put(
+                script.copy(
+                    name = script.name.take(120),
+                    urlPattern = script.urlPattern.take(512),
+                    code = script.code.take(200_000)
+                ).toJson()
+            )
+        }
         prefs.edit().putString("userscripts", arr.toString()).apply()
     }
 
@@ -174,7 +184,7 @@ class Settings(private val ctx: Context) {
         if (url.startsWith("about:") || url.isEmpty()) return
         val list = getHistory().toMutableList()
         list.removeAll { it.first == url }
-        list.add(0, url to title)
+        list.add(0, url.take(4096) to title.take(512))
         if (list.size > 50) list.subList(50, list.size).clear()
         val arr = JSONArray()
         list.forEach { (u, t) -> arr.put(JSONObject().put("url", u).put("title", t)) }
@@ -196,12 +206,31 @@ class Settings(private val ctx: Context) {
     // ---------- 屏幕方向（auto/portrait/landscape） ----------
     var screenOrientation: String
         get() = prefs.getString("screen_orientation", "auto") ?: "auto"
-        set(v) = prefs.edit().putString("screen_orientation", v).apply()
+        set(v) = prefs.edit()
+            .putString("screen_orientation", v.takeIf { it in setOf("auto", "portrait", "landscape") } ?: "auto")
+            .apply()
 
     // ---------- 允许调试网页（WebView 远程调试） ----------
     var debugWeb: Boolean
         get() = prefs.getBoolean("debug_web", false)
         set(v) = prefs.edit().putBoolean("debug_web", v).apply()
+
+    // ---------- 诊断 API 安全 ----------
+    var lanApiEnabled: Boolean
+        get() = prefs.getBoolean("lan_api_enabled", false)
+        set(v) = prefs.edit().putBoolean("lan_api_enabled", v).apply()
+
+    val apiToken: String
+        get() {
+            prefs.getString("api_token", null)?.takeIf { it.length >= 24 }?.let { return it }
+            val bytes = ByteArray(24).also { SecureRandom().nextBytes(it) }
+            val token = Base64.encodeToString(
+                bytes,
+                Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING
+            )
+            prefs.edit().putString("api_token", token).apply()
+            return token
+        }
 
     // ---------- 定制菜单（菜单项显隐） ----------
     fun getMenuConfig(): Map<String, Boolean> {
