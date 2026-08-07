@@ -20,6 +20,12 @@ import java.util.zip.ZipOutputStream
  * 打包为 zip 保存到「下载」目录，便于后续功能开发与离线分析。
  */
 object SourcePacker {
+    private const val MAX_ASSET_COUNT = 12
+    private const val MAX_ASSET_BYTES = 5 * 1024 * 1024
+
+    private val executor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "BrowserDiag-SourcePacker").apply { isDaemon = true }
+    }
 
     /**
      * 打包网页源码。html 来自页面 outerHTML；console/network 由调用方提供。
@@ -35,11 +41,12 @@ object SourcePacker {
         ua: String,
         onDone: (Boolean, String) -> Unit
     ) {
-        val executor = Executors.newSingleThreadExecutor()
         executor.execute {
+            var zipFile: File? = null
             try {
-                val zipFile = File(context.cacheDir, "browserdiag_source_${System.currentTimeMillis()}.zip")
-                ZipOutputStream(FileOutputStream(zipFile)).use { zos ->
+                val tempFile = File(context.cacheDir, "browserdiag_source_${System.currentTimeMillis()}.zip")
+                zipFile = tempFile
+                ZipOutputStream(FileOutputStream(tempFile)).use { zos ->
 
                     // 1. 页面 HTML
                     zos.putNextEntry(ZipEntry("index.html"))
@@ -67,10 +74,10 @@ object SourcePacker {
                     zos.closeEntry()
 
                     // 5. 尽力下载页面内静态资源（css/js，最多 12 个）
-                    val assets = extractAssetUrls(html)
+                    val assets = extractAssetUrls(html, url)
                     var saved = 0
                     for ((name, assetUrl) in assets) {
-                        if (saved >= 12) break
+                        if (saved >= MAX_ASSET_COUNT) break
                         try {
                             val bytes = download(assetUrl, 8000)
                             if (bytes != null && bytes.isNotEmpty()) {
@@ -87,33 +94,47 @@ object SourcePacker {
 
                 // 保存到「下载」目录
                 val displayName = "browserdiag_source_${System.currentTimeMillis()}.zip"
-                val savedPath = saveToDownloads(context, zipFile, displayName)
+                val savedPath = saveToDownloads(context, tempFile, displayName)
                 onDone(true, savedPath)
             } catch (e: Exception) {
                 onDone(false, e.message ?: e.toString())
+            } finally {
+                zipFile?.delete()
             }
         }
     }
 
-    /** 从 HTML 提取可下载的静态资源（去重、仅同站相对路径或 http(s)） */
-    private fun extractAssetUrls(html: String): List<Pair<String, String>> {
+    /** 从 HTML 提取可下载的静态资源（去重，支持绝对、协议相对和页面相对 URL）。 */
+    private fun extractAssetUrls(html: String, pageUrl: String): List<Pair<String, String>> {
         val out = LinkedHashMap<String, String>()
-        val css = Regex("""<link[^>]*rel=["']stylesheet["'][^>]*href=["']([^"']+)["']""")
-            .findAll(html)
-        for (m in css) {
-            val href = m.groupValues[1]
-            if (href.startsWith("http://") || href.startsWith("https://") || href.startsWith("//")) {
-                val name = "css_" + href.hashCode().toUInt() + ".css"
-                out[name] = if (href.startsWith("//")) "https:$href" else href
+        val base = runCatching { URL(pageUrl) }.getOrNull()
+
+        fun resolve(raw: String): String? {
+            if (raw.isBlank() || raw.startsWith("data:", true) || raw.startsWith("blob:", true)) return null
+            val resolved = runCatching { if (base != null) URL(base, raw) else URL(raw) }.getOrNull()
+                ?: return null
+            if (resolved.protocol != "http" && resolved.protocol != "https") return null
+            return resolved.toString()
+        }
+
+        fun attr(tag: String, name: String): String? =
+            Regex("""\b${name}\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+                .find(tag)?.groupValues?.getOrNull(1)
+
+        Regex("""<link\b[^>]*>""", RegexOption.IGNORE_CASE).findAll(html).forEach { match ->
+            val tag = match.value
+            val rel = attr(tag, "rel") ?: return@forEach
+            if (!rel.split(Regex("""\s+""")).any { it.equals("stylesheet", true) }) return@forEach
+            val href = attr(tag, "href") ?: return@forEach
+            resolve(href)?.let { resolved ->
+                out["css_${resolved.hashCode().toUInt()}.css"] = resolved
             }
         }
-        val js = Regex("""<script[^>]*src=["']([^"']+)["']""")
-            .findAll(html)
-        for (m in js) {
-            val src = m.groupValues[1]
-            if (src.startsWith("http://") || src.startsWith("https://") || src.startsWith("//")) {
-                val name = "js_" + src.hashCode().toUInt() + ".js"
-                out[name] = if (src.startsWith("//")) "https:$src" else src
+
+        Regex("""<script\b[^>]*>""", RegexOption.IGNORE_CASE).findAll(html).forEach { match ->
+            val src = attr(match.value, "src") ?: return@forEach
+            resolve(src)?.let { resolved ->
+                out["js_${resolved.hashCode().toUInt()}.js"] = resolved
             }
         }
         return out.toList()
@@ -124,11 +145,24 @@ object SourcePacker {
         conn.connectTimeout = timeoutMs
         conn.readTimeout = timeoutMs
         conn.requestMethod = "GET"
-        conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) BrowserDiag/2.1")
+        conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) BrowserDiag/3.2")
         conn.instanceFollowRedirects = true
         return try {
             if (conn.responseCode in 200..299) {
-                conn.inputStream.use { it.readBytes() }
+                if (conn.contentLengthLong > MAX_ASSET_BYTES) return null
+                conn.inputStream.use { input ->
+                    val out = java.io.ByteArrayOutputStream()
+                    val buffer = ByteArray(8192)
+                    var total = 0
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read <= 0) break
+                        total += read
+                        if (total > MAX_ASSET_BYTES) return null
+                        out.write(buffer, 0, read)
+                    }
+                    out.toByteArray()
+                }
             } else null
         } finally {
             conn.disconnect()
