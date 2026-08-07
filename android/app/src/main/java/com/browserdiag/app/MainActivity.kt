@@ -3,6 +3,7 @@ package com.browserdiag.app
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.AlertDialog
+import android.app.Dialog
 import android.app.DownloadManager
 import android.content.ActivityNotFoundException
 import android.content.ClipData
@@ -10,10 +11,12 @@ import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.res.ColorStateList
 import android.content.pm.ActivityInfo
 import android.database.Cursor
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -38,6 +41,7 @@ import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
@@ -47,8 +51,12 @@ import androidx.core.content.ContextCompat
 import androidx.core.graphics.drawable.IconCompat
 import androidx.core.content.pm.ShortcutInfoCompat
 import androidx.core.content.pm.ShortcutManagerCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+import com.google.android.material.bottomsheet.BottomSheetDialog
+import com.google.android.material.card.MaterialCardView
+import com.google.android.material.materialswitch.MaterialSwitch
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 import org.json.JSONArray
@@ -78,24 +86,31 @@ class MainActivity : AppCompatActivity() {
     private lateinit var bottomBar: LinearLayout
     private lateinit var findBar: LinearLayout
     private lateinit var findInput: EditText
+    private lateinit var addressCard: MaterialCardView
+    private lateinit var siteInfoButton: ImageButton
+    private lateinit var pageActionButton: ImageButton
+    private lateinit var tabCountButton: TextView
+    private lateinit var pageProgress: ProgressBar
+    private lateinit var backButton: ImageButton
+    private lateinit var forwardButton: ImageButton
     private val consoleLogs = mutableListOf<JSONObject>()
     private var server: DiagServer? = null
     private var serverPort = 8788
     private var tts: TextToSpeech? = null
     private var isDark = false
     private var isFullscreen = false
-    private var mainMenuDialog: AlertDialog? = null
+    private var mainMenuDialog: Dialog? = null
 
-    // 主题色
-    private val C_BAR_LIGHT = 0xFFF0F0F0.toInt()
-    private val C_BAR_DARK = 0xFF1E293B.toInt()
-    private val C_TEXT_LIGHT = 0xFF202020.toInt()
-    private val C_TEXT_DARK = 0xFFE2E8F0.toInt()
-    private val C_FIELD_LIGHT = 0xFFFFFFFF.toInt()
-    private val C_FIELD_DARK = 0xFF334155.toInt()
-    private val C_STATUS_LIGHT = 0xFFE2E8F0.toInt()
-    private val C_STATUS_DARK = 0xFF0F172A.toInt()
-    private val C_ACCENT = 0xFF1A73E8.toInt()
+    // Chrome / Material 3 风格调色板。手动主题与系统组件主题保持同步。
+    private fun surfaceColor() = if (isDark) 0xFF202124.toInt() else 0xFFF8FAFD.toInt()
+    private fun barColor() = if (isDark) 0xFF292A2D.toInt() else 0xFFF1F3F4.toInt()
+    private fun fieldColor() = if (isDark) 0xFF303134.toInt() else 0xFFE9EEF6.toInt()
+    private fun tonalColor() = if (isDark) 0xFF3C4043.toInt() else 0xFFE8EAED.toInt()
+    private fun textColor() = if (isDark) 0xFFE8EAED.toInt() else 0xFF1F1F1F.toInt()
+    private fun secondaryTextColor() = if (isDark) 0xFFBDC1C6.toInt() else 0xFF5F6368.toInt()
+    private fun dividerColor() = if (isDark) 0xFF3C4043.toInt() else 0xFFDADCE0.toInt()
+    private fun accentColor() = if (isDark) 0xFF8AB4F8.toInt() else 0xFF0B57D0.toInt()
+    private fun accentContainerColor() = if (isDark) 0xFF233A5A.toInt() else 0xFFD3E3FD.toInt()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         installCrashHandler()
@@ -103,6 +118,10 @@ class MainActivity : AppCompatActivity() {
         settings = Settings(this)
         tabs = Tabs(this)
         isDark = settings.darkMode
+        theme.applyStyle(
+            if (isDark) R.style.ThemeOverlay_BrowserDiag_Dark else R.style.ThemeOverlay_BrowserDiag_Light,
+            true
+        )
         WebView.setWebContentsDebuggingEnabled(settings.debugWeb)
         applySavedOrientation()
         buildUi()
@@ -151,74 +170,122 @@ class MainActivity : AppCompatActivity() {
     private fun buildUi() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            isFocusableInTouchMode = true
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
             )
         }
 
-        // ---- 顶部：胶囊地址栏 ----
+        // ---- 顶部：Chrome 风格 Omnibox + 标签计数 + 更多菜单 ----
         topBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(10, 8, 10, 8)
+            setPadding(10.dp(), 8.dp(), 6.dp(), 8.dp())
             layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                ViewGroup.LayoutParams.MATCH_PARENT, 64.dp()
             )
         }
-        val fieldWrap = LinearLayout(this).apply {
+        addressCard = MaterialCardView(this).apply {
+            radius = 24.dp().toFloat()
+            cardElevation = 0f
+            strokeWidth = 1.dp()
+            layoutParams = LinearLayout.LayoutParams(0, 48.dp(), 1f).apply {
+                marginEnd = 4.dp()
+            }
+        }
+        val addressRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(12, 0, 4, 0)
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            setPadding(4.dp(), 0, 2.dp(), 0)
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
+            )
         }
-        fieldWrap.addView(iconBtn(R.drawable.ic_search, 20) { /* 占位：点击聚焦输入框 */ urlInput.requestFocus() })
+        siteInfoButton = iconBtn(R.drawable.ic_search, 20, "站点信息") {
+            if (urlInput.hasFocus()) urlInput.requestFocus() else showSiteInfo()
+        }
+        addressRow.addView(siteInfoButton)
         urlInput = EditText(this).apply {
             hint = "搜索或输入网址"
             textSize = 15f
             background = null
             setSingleLine(true)
-            inputType = InputType.TYPE_TEXT_VARIATION_URI or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            setSelectAllOnFocus(true)
+            setPadding(2.dp(), 0, 2.dp(), 0)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI or
+                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
             imeOptions = EditorInfo.IME_ACTION_GO
             setOnEditorActionListener { _, actionId, _ ->
                 if (actionId == EditorInfo.IME_ACTION_GO) { navigate(urlInput.text.toString()); true } else false
             }
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            setOnFocusChangeListener { _, focused ->
+                val actualUrl = currentWeb()?.url.orEmpty()
+                if (actualUrl.isNotBlank()) {
+                    setText(if (focused) actualUrl else compactUrl(actualUrl))
+                    if (focused) selectAll()
+                }
+                updateChromeControls()
+            }
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
         }
-        fieldWrap.addView(urlInput)
-        topBar.addView(fieldWrap)
-        topBar.addView(iconBtn(R.drawable.ic_arrow, 22) { navigate(urlInput.text.toString()) })
+        addressRow.addView(urlInput)
+        pageActionButton = iconBtn(R.drawable.ic_refresh, 20, "刷新或停止") { reloadOrStop() }
+        addressRow.addView(pageActionButton)
+        addressCard.addView(addressRow)
+        topBar.addView(addressCard)
+
+        tabCountButton = TextView(this).apply {
+            text = "1"
+            textSize = 13f
+            gravity = Gravity.CENTER
+            setTypeface(null, android.graphics.Typeface.BOLD)
+            contentDescription = "标签页"
+            isClickable = true
+            isFocusable = true
+            layoutParams = LinearLayout.LayoutParams(40.dp(), 40.dp()).apply {
+                marginStart = 2.dp()
+                marginEnd = 2.dp()
+            }
+            setOnClickListener { showTabsDialog() }
+        }
+        topBar.addView(tabCountButton)
+        topBar.addView(iconBtn(R.drawable.ic_menu, 24, "更多") { showMainMenu() })
         root.addView(topBar)
 
-        // ---- 查找栏（默认隐藏） ----
+        pageProgress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            progress = 0
+            visibility = View.GONE
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 2.dp())
+        }
+        root.addView(pageProgress)
+
+        // ---- 页面查找栏：独立浮层式工具条 ----
         findBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(10, 4, 10, 4)
+            setPadding(12.dp(), 4.dp(), 6.dp(), 4.dp())
             visibility = View.GONE
             layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-            )
+                ViewGroup.LayoutParams.MATCH_PARENT, 52.dp()
+            ).apply {
+                marginStart = 10.dp()
+                marginEnd = 10.dp()
+                bottomMargin = 4.dp()
+            }
         }
         findInput = EditText(this).apply {
             hint = "查找内容"
             textSize = 14f
+            background = null
             setSingleLine(true)
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
         findBar.addView(findInput)
-        findBar.addView(iconBtn(R.drawable.ic_arrow, 18) { findNext(false) }) // 上一个
-        findBar.addView(iconBtn(R.drawable.ic_forward, 18) { findNext(true) }) // 下一个
-        findBar.addView(iconBtn(R.drawable.ic_close, 18) { hideFindBar() })
+        findBar.addView(iconBtn(R.drawable.ic_back, 18, "上一个匹配项") { findNext(false) })
+        findBar.addView(iconBtn(R.drawable.ic_forward, 18, "下一个匹配项") { findNext(true) })
+        findBar.addView(iconBtn(R.drawable.ic_close, 18, "关闭查找") { hideFindBar() })
         root.addView(findBar)
-
-        // ---- 状态栏 ----
-        statusBar = TextView(this).apply {
-            text = "启动中…"
-            textSize = 11f
-            setPadding(12, 4, 12, 4)
-            setSingleLine(true)
-        }
-        root.addView(statusBar)
 
         // ---- WebView 容器 ----
         webContainer = FrameLayout(this).apply {
@@ -228,63 +295,123 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(webContainer)
 
-        // ---- 底部导航栏（矢量图标） ----
+        // ---- BrowserDiag 状态条：和网页内容分离，不占用 Omnibox ----
+        statusBar = TextView(this).apply {
+            text = "正在启动诊断服务…"
+            textSize = 10.5f
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(14.dp(), 0, 14.dp(), 0)
+            setSingleLine(true)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 28.dp())
+        }
+        root.addView(statusBar)
+
+        // ---- 底部快捷导航：5 个高频动作，避免旧版 6 图标拥挤 ----
         bottomBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            setPadding(0, 4, 0, 4)
+            setPadding(4.dp(), 4.dp(), 4.dp(), 4.dp())
             layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                ViewGroup.LayoutParams.MATCH_PARENT, 60.dp()
             )
         }
-        bottomBar.addView(navBtn(R.drawable.ic_home) { goHome() })
-        bottomBar.addView(navBtn(R.drawable.ic_back) { currentWeb()?.let { if (it.canGoBack()) it.goBack() } })
-        bottomBar.addView(navBtn(R.drawable.ic_forward) { currentWeb()?.let { if (it.canGoForward()) it.goForward() } })
-        bottomBar.addView(navBtn(R.drawable.ic_refresh) { currentWeb()?.reload() })
-        bottomBar.addView(navBtn(R.drawable.ic_tab) { showTabsDialog() })
-        bottomBar.addView(navBtn(R.drawable.ic_menu) { showMainMenu() })
+        backButton = navBtn(R.drawable.ic_back, "后退") {
+            currentWeb()?.let { if (it.canGoBack()) it.goBack() }
+        }
+        forwardButton = navBtn(R.drawable.ic_forward, "前进") {
+            currentWeb()?.let { if (it.canGoForward()) it.goForward() }
+        }
+        bottomBar.addView(backButton)
+        bottomBar.addView(forwardButton)
+        bottomBar.addView(navBtn(R.drawable.ic_home, "主页") { goHome() })
+        bottomBar.addView(navBtn(R.drawable.ic_new_tab, "新建标签") { newTab(settings.engine.homeUrl) })
+        bottomBar.addView(navBtn(R.drawable.ic_share, "分享当前页") { sharePage() })
         root.addView(bottomBar)
 
         setContentView(root)
+        root.requestFocus()
     }
 
-    private fun iconBtn(drawableRes: Int, sizeDp: Int = 24, action: () -> Unit): ImageButton {
+    private fun iconBtn(
+        drawableRes: Int,
+        sizeDp: Int = 24,
+        description: String? = null,
+        action: () -> Unit
+    ): ImageButton {
         val dp = (sizeDp * resources.displayMetrics.density).toInt()
         return ImageButton(this).apply {
             setImageResource(drawableRes)
-            setBackgroundColor(Color.TRANSPARENT)
+            val ripple = android.util.TypedValue()
+            if (theme.resolveAttribute(android.R.attr.selectableItemBackgroundBorderless, ripple, true)) {
+                setBackgroundResource(ripple.resourceId)
+            } else {
+                setBackgroundColor(Color.TRANSPARENT)
+            }
             scaleType = ImageView.ScaleType.CENTER_INSIDE
+            contentDescription = description
+            isFocusable = true
             layoutParams = LinearLayout.LayoutParams(dp + 12, dp + 12)
             setOnClickListener { action() }
         }
     }
 
-    private fun navBtn(drawableRes: Int, action: () -> Unit): ImageButton =
+    private fun navBtn(drawableRes: Int, description: String, action: () -> Unit): ImageButton =
         ImageButton(this).apply {
             setImageResource(drawableRes)
-            setBackgroundColor(Color.TRANSPARENT)
+            val ripple = android.util.TypedValue()
+            if (theme.resolveAttribute(android.R.attr.selectableItemBackgroundBorderless, ripple, true)) {
+                setBackgroundResource(ripple.resourceId)
+            } else {
+                setBackgroundColor(Color.TRANSPARENT)
+            }
             scaleType = ImageView.ScaleType.CENTER_INSIDE
+            contentDescription = description
             layoutParams = LinearLayout.LayoutParams(0, 52.dp(), 1f)
             setOnClickListener { action() }
         }
 
     private fun Int.dp(): Int = (this * resources.displayMetrics.density).toInt()
 
-    /** 应用主题（浅色 Chrome 风格 / 深色） */
+    private fun roundedBackground(color: Int, radiusDp: Int, strokeColor: Int? = null): GradientDrawable =
+        GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            setColor(color)
+            cornerRadius = radiusDp.dp().toFloat()
+            strokeColor?.let { setStroke(1.dp(), it) }
+        }
+
+    private fun tabCountBackground(): GradientDrawable =
+        roundedBackground(Color.TRANSPARENT, 11, secondaryTextColor())
+
+    /** 应用 Chrome/Material 视觉系统，并同步系统状态栏的明暗图标。 */
     private fun applyTheme() {
-        val bar = if (isDark) C_BAR_DARK else C_BAR_LIGHT
-        val text = if (isDark) C_TEXT_DARK else C_TEXT_LIGHT
-        val field = if (isDark) C_FIELD_DARK else C_FIELD_LIGHT
-        topBar.setBackgroundColor(bar)
-        bottomBar.setBackgroundColor(bar)
-        statusBar.setBackgroundColor(if (isDark) C_STATUS_DARK else C_STATUS_LIGHT)
-        statusBar.setTextColor(if (isDark) C_TEXT_DARK else 0xFF475569.toInt())
-        urlInput.setTextColor(text)
-        urlInput.setHintTextColor(if (isDark) 0xFF94A3B8.toInt() else 0xFF94A3B8.toInt())
-        findBar.setBackgroundColor(if (isDark) C_BAR_DARK else 0xFFE5E7EB.toInt())
-        findInput.setTextColor(text)
-        findInput.setHintTextColor(0xFF94A3B8.toInt())
-        val tint = if (isDark) C_TEXT_DARK else 0xFF374151.toInt()
+        theme.applyStyle(
+            if (isDark) R.style.ThemeOverlay_BrowserDiag_Dark else R.style.ThemeOverlay_BrowserDiag_Light,
+            true
+        )
+        window.statusBarColor = surfaceColor()
+        window.navigationBarColor = barColor()
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            isAppearanceLightStatusBars = !isDark
+            isAppearanceLightNavigationBars = !isDark
+        }
+        topBar.setBackgroundColor(surfaceColor())
+        bottomBar.setBackgroundColor(barColor())
+        addressCard.setCardBackgroundColor(fieldColor())
+        addressCard.strokeColor = dividerColor()
+        statusBar.setBackgroundColor(if (isDark) 0xFF252629.toInt() else 0xFFF1F3F4.toInt())
+        statusBar.setTextColor(secondaryTextColor())
+        urlInput.setTextColor(textColor())
+        urlInput.setHintTextColor(secondaryTextColor())
+        findBar.background = roundedBackground(fieldColor(), 16, dividerColor())
+        findInput.setTextColor(textColor())
+        findInput.setHintTextColor(secondaryTextColor())
+        tabCountButton.setTextColor(textColor())
+        tabCountButton.background = tabCountBackground()
+        pageProgress.progressTintList = ColorStateList.valueOf(accentColor())
+        pageProgress.progressBackgroundTintList = ColorStateList.valueOf(Color.TRANSPARENT)
+
+        val tint = textColor()
         val barChildren = ArrayList<View>()
         barChildren.addAll(topBar.children())
         barChildren.addAll(bottomBar.children())
@@ -292,8 +419,9 @@ class MainActivity : AppCompatActivity() {
         barChildren.forEach { v ->
             if (v is ImageButton) v.setColorFilter(tint)
         }
-        // 地址栏胶囊背景
-        (topBar.getChildAt(0) as? LinearLayout)?.setBackgroundColor(field)
+        siteInfoButton.setColorFilter(secondaryTextColor())
+        pageActionButton.setColorFilter(secondaryTextColor())
+        updateChromeControls()
         statusBar.text = buildStatusText()
     }
 
@@ -303,8 +431,296 @@ class MainActivity : AppCompatActivity() {
     private fun buildStatusText(): String {
         val errs = synchronized(consoleLogs) { consoleLogs.filter { it.optString("type") == "error" }.size }
         val scope = if (settings.lanApiEnabled) "局域网" else "本机"
-        val api = if (server == null) "API: 未启动" else "API: ${apiBaseUrl()} 🔒$scope"
-        return "$api  |  ${settings.engine.label}  |  ${settings.uaMode.label}  |  tab ${tabs.size}  |  console: ${consoleLogs.size} (err $errs)"
+        val api = if (server == null) "API 未启动" else "API $scope · ${serverPort}"
+        return "$api  ·  ${settings.engine.label}  ·  ${settings.uaMode.label}  ·  ${tabs.size} 标签  ·  Console ${consoleLogs.size} / $errs 错误"
+    }
+
+    private fun reloadOrStop() {
+        val wv = currentWeb() ?: return
+        if (pageProgress.visibility == View.VISIBLE && wv.progress in 0..99) {
+            wv.stopLoading()
+            pageProgress.visibility = View.GONE
+            pageProgress.progress = 0
+            pageActionButton.setImageResource(R.drawable.ic_refresh)
+            pageActionButton.contentDescription = "刷新页面"
+            return
+        } else {
+            wv.reload()
+        }
+        updateChromeControls()
+    }
+
+    private fun updateChromeControls() {
+        if (!::tabCountButton.isInitialized) return
+        val wv = currentWeb()
+        val currentUrl = wv?.url.orEmpty()
+        val currentProgress = wv?.progress ?: 100
+        pageProgress.progress = currentProgress
+        if (!isFullscreen) {
+            pageProgress.visibility = if (currentProgress in 1..99) View.VISIBLE else View.GONE
+        }
+        val loading = wv != null && !isFullscreen && currentProgress in 1..99
+        tabCountButton.text = tabs.size.toString()
+        backButton.isEnabled = wv?.canGoBack() == true
+        forwardButton.isEnabled = wv?.canGoForward() == true
+        backButton.alpha = if (backButton.isEnabled) 1f else 0.35f
+        forwardButton.alpha = if (forwardButton.isEnabled) 1f else 0.35f
+        pageActionButton.setImageResource(if (loading) R.drawable.ic_close else R.drawable.ic_refresh)
+        pageActionButton.contentDescription = if (loading) "停止加载" else "刷新页面"
+        val siteIcon = when {
+            urlInput.hasFocus() -> R.drawable.ic_search
+            currentUrl.startsWith("https://", true) -> R.drawable.ic_lock
+            currentUrl.isNotBlank() -> R.drawable.ic_info
+            else -> R.drawable.ic_search
+        }
+        siteInfoButton.setImageResource(siteIcon)
+    }
+
+    /** Chrome 风格底部功能面板：统一标题、动作区、滚动内容和深浅色。 */
+    private fun showBrowserSheet(
+        title: String,
+        subtitle: String = "",
+        headerActionLabel: String? = null,
+        headerAction: ((BottomSheetDialog) -> Unit)? = null,
+        buildContent: (LinearLayout, BottomSheetDialog) -> Unit
+    ): BottomSheetDialog {
+        val dialog = BottomSheetDialog(this)
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(12.dp(), 10.dp(), 12.dp(), 18.dp())
+            background = roundedBackground(surfaceColor(), 28)
+        }
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(8.dp(), 2.dp(), 2.dp(), 8.dp())
+        }
+        val heading = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            addView(TextView(this@MainActivity).apply {
+                text = title
+                textSize = 20f
+                setTextColor(textColor())
+                setTypeface(null, android.graphics.Typeface.BOLD)
+            })
+            if (subtitle.isNotBlank()) {
+                addView(TextView(this@MainActivity).apply {
+                    text = subtitle
+                    textSize = 12f
+                    setTextColor(secondaryTextColor())
+                    maxLines = 1
+                })
+            }
+        }
+        header.addView(heading)
+        if (headerActionLabel != null && headerAction != null) {
+            header.addView(TextView(this).apply {
+                text = headerActionLabel
+                textSize = 13f
+                gravity = Gravity.CENTER
+                setTextColor(accentColor())
+                setTypeface(null, android.graphics.Typeface.BOLD)
+                background = roundedBackground(accentContainerColor(), 18)
+                setPadding(14.dp(), 8.dp(), 14.dp(), 8.dp())
+                isClickable = true
+                setOnClickListener { headerAction(dialog) }
+            })
+        }
+        header.addView(iconBtn(R.drawable.ic_close, 20, "关闭") { dialog.dismiss() }.apply {
+            setColorFilter(secondaryTextColor())
+        })
+        root.addView(header)
+
+        val maxSheetContentHeight = minOf(540.dp(), (resources.displayMetrics.heightPixels * 0.66f).toInt())
+        val scroll = ScrollView(this).apply {
+            isFillViewport = false
+            overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
+        }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 2.dp(), 0, 6.dp())
+        }
+        buildContent(content, dialog)
+        val estimatedContentHeight = maxOf(190.dp(), content.childCount * 72.dp())
+        scroll.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            minOf(maxSheetContentHeight, estimatedContentHeight)
+        )
+        scroll.addView(content)
+        root.addView(scroll)
+        dialog.setContentView(root)
+        dialog.show()
+        return dialog
+    }
+
+    private fun sectionTitle(label: String): TextView = TextView(this).apply {
+        text = label
+        textSize = 12f
+        setTextColor(accentColor())
+        setTypeface(null, android.graphics.Typeface.BOLD)
+        setPadding(14.dp(), 18.dp(), 14.dp(), 6.dp())
+    }
+
+    private fun quickAction(iconRes: Int, label: String, action: () -> Unit): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            minimumHeight = 76.dp()
+            background = roundedBackground(accentContainerColor(), 18)
+            isClickable = true
+            isFocusable = true
+            contentDescription = label
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginStart = 3.dp()
+                marginEnd = 3.dp()
+            }
+            setOnClickListener { action() }
+            addView(ImageView(this@MainActivity).apply {
+                setImageResource(iconRes)
+                setColorFilter(accentColor())
+                layoutParams = LinearLayout.LayoutParams(24.dp(), 24.dp()).apply {
+                    gravity = Gravity.CENTER_HORIZONTAL
+                }
+            })
+            addView(TextView(this@MainActivity).apply {
+                text = label
+                textSize = 11.5f
+                setTextColor(textColor())
+                gravity = Gravity.CENTER
+                setPadding(0, 7.dp(), 0, 0)
+            })
+        }
+
+    private fun panelRow(
+        iconRes: Int,
+        title: String,
+        subtitle: String = "",
+        trailingIcon: Int? = null,
+        selected: Boolean = false,
+        onTrailing: (() -> Unit)? = null,
+        onClick: (() -> Unit)? = null
+    ): MaterialCardView {
+        val card = MaterialCardView(this).apply {
+            radius = 16.dp().toFloat()
+            cardElevation = 0f
+            strokeWidth = 1.dp()
+            strokeColor = if (selected) accentColor() else dividerColor()
+            setCardBackgroundColor(if (selected) accentContainerColor() else fieldColor())
+            isClickable = onClick != null
+            isFocusable = onClick != null
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                marginStart = 4.dp()
+                marginEnd = 4.dp()
+                topMargin = 4.dp()
+                bottomMargin = 4.dp()
+            }
+            if (onClick != null) setOnClickListener { onClick() }
+        }
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            minimumHeight = 64.dp()
+            setPadding(14.dp(), 8.dp(), 8.dp(), 8.dp())
+        }
+        row.addView(ImageView(this).apply {
+            setImageResource(iconRes)
+            setColorFilter(if (selected) accentColor() else secondaryTextColor())
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+            layoutParams = LinearLayout.LayoutParams(28.dp(), 28.dp()).apply { marginEnd = 14.dp() }
+        })
+        row.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            addView(TextView(this@MainActivity).apply {
+                text = title
+                textSize = 14.5f
+                setTextColor(textColor())
+                maxLines = 1
+            })
+            if (subtitle.isNotBlank()) {
+                addView(TextView(this@MainActivity).apply {
+                    text = subtitle
+                    textSize = 11.5f
+                    setTextColor(secondaryTextColor())
+                    maxLines = 2
+                })
+            }
+        })
+        if (trailingIcon != null && onTrailing != null) {
+            row.addView(iconBtn(trailingIcon, 20, "更多操作") { onTrailing() }.apply {
+                setColorFilter(secondaryTextColor())
+            })
+        }
+        card.addView(row)
+        return card
+    }
+
+    private fun emptyPanel(iconRes: Int, title: String, subtitle: String): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(24.dp(), 42.dp(), 24.dp(), 42.dp())
+            addView(ImageView(this@MainActivity).apply {
+                setImageResource(iconRes)
+                setColorFilter(secondaryTextColor())
+                layoutParams = LinearLayout.LayoutParams(40.dp(), 40.dp()).apply { gravity = Gravity.CENTER_HORIZONTAL }
+            })
+            addView(TextView(this@MainActivity).apply {
+                text = title
+                textSize = 16f
+                setTextColor(textColor())
+                setTypeface(null, android.graphics.Typeface.BOLD)
+                gravity = Gravity.CENTER
+                setPadding(0, 12.dp(), 0, 4.dp())
+            })
+            addView(TextView(this@MainActivity).apply {
+                text = subtitle
+                textSize = 12.5f
+                setTextColor(secondaryTextColor())
+                gravity = Gravity.CENTER
+            })
+        }
+
+    private fun displayHost(url: String): String = runCatching {
+        Uri.parse(url).host?.removePrefix("www.")
+    }.getOrNull().orEmpty().ifEmpty { url.take(64) }
+
+    private fun compactUrl(url: String): String = when {
+        url.startsWith("https://www.", true) -> url.substring(12)
+        url.startsWith("http://www.", true) -> url.substring(11)
+        url.startsWith("https://", true) -> url.substring(8)
+        url.startsWith("http://", true) -> url.substring(7)
+        else -> url
+    }
+
+    private fun setOmniboxUrl(url: String) {
+        if (!::urlInput.isInitialized || urlInput.hasFocus()) return
+        urlInput.setText(compactUrl(url))
+    }
+
+    private fun showSiteInfo() {
+        val url = currentWeb()?.url.orEmpty()
+        if (url.isBlank()) return
+        val secure = url.startsWith("https://", true)
+        showBrowserSheet("站点信息", displayHost(url)) { content, dialog ->
+            content.addView(panelRow(
+                if (secure) R.drawable.ic_lock else R.drawable.ic_info,
+                if (secure) "连接安全" else "连接未加密",
+                if (secure) "此页面使用 HTTPS 加密连接" else "HTTP 页面不会加密传输内容"
+            ))
+            content.addView(panelRow(R.drawable.ic_link, "当前地址", url.take(180), onClick = {
+                copyText(url)
+                dialog.dismiss()
+            }))
+            content.addView(panelRow(R.drawable.ic_tools, "页面诊断", "查看 API、Console 与当前标签状态", onClick = {
+                dialog.dismiss()
+                devTools()
+            }))
+        }
     }
 
     private fun initialUrlFromIntent(source: Intent?): String? {
@@ -343,7 +759,8 @@ class MainActivity : AppCompatActivity() {
         configureWebView(tab.webView)
         tabs.switchTo(tab.id)
         tab.webView.loadUrl(url)
-        urlInput.setText(url)
+        setOmniboxUrl(url)
+        updateChromeControls()
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -384,6 +801,13 @@ class MainActivity : AppCompatActivity() {
         }
 
         wv.webChromeClient = object : WebChromeClient() {
+            override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                if (tabs.current?.webView !== view) return
+                pageProgress.progress = newProgress
+                pageProgress.visibility = if (!isFullscreen && newProgress in 1..99) View.VISIBLE else View.GONE
+                updateChromeControls()
+            }
+
             override fun onConsoleMessage(msg: ConsoleMessage): Boolean {
                 val entry = JSONObject()
                     .put("ts", System.currentTimeMillis())
@@ -401,7 +825,8 @@ class MainActivity : AppCompatActivity() {
                 val tab = tabs.all.firstOrNull { it.webView === view } ?: return
                 tab.title = title.orEmpty()
                 if (tabs.current === tab) {
-                    urlInput.setText(tab.url)
+                    setOmniboxUrl(tab.url)
+                    updateChromeControls()
                 }
             }
         }
@@ -415,14 +840,16 @@ class MainActivity : AppCompatActivity() {
                     settings.addHistory(tab.url, tab.title)
                 }
                 if (tab != null && tabs.current === tab) {
-                    urlInput.setText(url.orEmpty())
+                    setOmniboxUrl(url.orEmpty())
+                    updateChromeControls()
                 }
                 runOnUiThread { statusBar.text = buildStatusText() }
             }
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 if (tabs.current?.webView === view) {
-                    urlInput.setText(url ?: "")
+                    setOmniboxUrl(url.orEmpty())
+                    updateChromeControls()
                 }
             }
 
@@ -483,24 +910,46 @@ class MainActivity : AppCompatActivity() {
 
     private fun showTabsDialog() {
         val all = tabs.all
-        val labels = all.mapIndexed { i, t ->
-            val title = t.title.ifEmpty { t.url }.ifEmpty { "新标签" }
-            val short = if (title.length > 26) title.take(26) + "…" else title
-            "${if (i == tabs.all.indexOf(tabs.current)) "● " else "○ "}$short"
-        }.toTypedArray()
-        AlertDialog.Builder(this)
-            .setTitle("标签页（${all.size}/5）")
-            .setItems(labels) { _, which ->
-                tabs.switchTo(all[which].id)
-                tabs.current?.let { urlInput.setText(it.url) }
+        showBrowserSheet(
+            title = "标签页",
+            subtitle = "${all.size}/5 · 点击卡片切换标签",
+            headerActionLabel = "＋ 新标签",
+            headerAction = { dialog ->
+                newTab(settings.engine.homeUrl)
+                dialog.dismiss()
             }
-            .setPositiveButton("＋ 新标签") { _, _ -> newTab(settings.engine.homeUrl) }
-            .setNeutralButton("关闭当前") { _, _ ->
-                tabs.current?.let { tabs.destroy(it.id) }
-                tabs.current?.let { urlInput.setText(it.url) } ?: run { newTab(settings.engine.homeUrl) }
+        ) { content, dialog ->
+            if (all.isEmpty()) {
+                content.addView(emptyPanel(R.drawable.ic_tab, "还没有标签页", "新建一个标签开始浏览"))
             }
-            .setNegativeButton("关闭", null)
-            .show()
+            all.forEach { tab ->
+                val isCurrent = tabs.current?.id == tab.id
+                val title = tab.title.ifEmpty { tab.url }.ifEmpty { "新标签" }
+                val subtitle = displayHost(tab.url).ifEmpty { "空白标签" }
+                content.addView(panelRow(
+                    iconRes = if (isCurrent) R.drawable.ic_tab else R.drawable.ic_link,
+                    title = title.take(64),
+                    subtitle = subtitle,
+                    trailingIcon = R.drawable.ic_close,
+                    selected = isCurrent,
+                    onTrailing = {
+                        tabs.destroy(tab.id)
+                        if (tabs.size == 0) newTab(settings.engine.homeUrl)
+                        tabs.current?.let { setOmniboxUrl(it.url) }
+                        updateChromeControls()
+                        statusBar.text = buildStatusText()
+                        dialog.dismiss()
+                    },
+                    onClick = {
+                        tabs.switchTo(tab.id)
+                        setOmniboxUrl(tab.url)
+                        updateChromeControls()
+                        statusBar.text = buildStatusText()
+                        dialog.dismiss()
+                    }
+                ))
+            }
+        }
     }
 
     // ==================== 导航 ====================
@@ -521,138 +970,129 @@ class MainActivity : AppCompatActivity() {
 
     private fun goHome() {
         currentWeb()?.loadUrl(settings.engine.homeUrl)
-        urlInput.setText(settings.engine.homeUrl)
+        setOmniboxUrl(settings.engine.homeUrl)
     }
 
-    // ==================== 主菜单（分组 + 矢量图标） ====================
+    // ==================== 主菜单：Chrome 快捷动作 + BrowserDiag 分组工具 ====================
     private fun showMainMenu() {
         val menuCfg = settings.getMenuConfig()
         fun enabled(id: String) = id == "menuconfig" || id == "about" || menuCfg[id] != false
         val groups = listOf(
-            Pair("📌 页面", listOf(
-                MenuItem("bookmark", R.drawable.ic_bookmark, "书签") { showBookmarks() },
-                MenuItem("save", R.drawable.ic_save, "保存页面") { savePage() },
-                MenuItem("share", R.drawable.ic_share, "分享") { sharePage() },
-                MenuItem("find", R.drawable.ic_find, "页面查找") { showFindBar() },
-                MenuItem("translate", R.drawable.ic_translate, "翻译本页") { translatePage() },
-                MenuItem("widget", R.drawable.ic_widget, "添加到桌面") { addToHome() },
-                MenuItem("fullscreen", R.drawable.ic_launch, "全屏模式") { toggleFullscreen() }
+            Pair("页面与内容", listOf(
+                MenuItem("translate", R.drawable.ic_translate, "翻译本页", "使用翻译服务打开当前页面") { translatePage() },
+                MenuItem("widget", R.drawable.ic_widget, "添加到桌面", "创建当前网站快捷方式") { addToHome() },
+                MenuItem("fullscreen", R.drawable.ic_launch, "全屏模式", "隐藏浏览器工具栏，专注页面内容") { toggleFullscreen() }
             )),
-            Pair("🌐 工具", listOf(
-                MenuItem("sniff", R.drawable.ic_movie, "嗅探媒体资源") { sniffMedia() },
-                MenuItem("resources", R.drawable.ic_folder, "查看页面资源") { pageResources() },
-                MenuItem("source", R.drawable.ic_code, "页面源码 (zip)") { downloadSourceZip() },
-                MenuItem("qr", R.drawable.ic_qr, "生成二维码") { showQr() },
-                MenuItem("tts", R.drawable.ic_mic, "语音播报") { speakPage() },
-                MenuItem("netlog", R.drawable.ic_download, "网络日志") { showNetLog() },
-                MenuItem("downloads", R.drawable.ic_arrow, "下载管理") { showDownloads() },
-                MenuItem("devtools", R.drawable.ic_tools, "开发者工具") { devTools() }
+            Pair("浏览数据", listOf(
+                MenuItem("bookmark", R.drawable.ic_bookmark, "书签", "收藏和管理常用页面") { showBookmarks() },
+                MenuItem("history", R.drawable.ic_history, "历史记录", "${settings.getHistory().size} 条最近访问记录") { showHistory() },
+                MenuItem("downloads", R.drawable.ic_download, "下载内容", "查看系统下载队列与已下载文件") { showDownloads() }
             )),
-            Pair("⚙️ 设置", listOf(
-                MenuItem("dark", R.drawable.ic_dark, "深色主题：${if (isDark) "开" else "关"}") { toggleDark() },
-                MenuItem("engine", R.drawable.ic_search, "搜索引擎：${settings.engine.label}") { showEnginePicker() },
-                MenuItem("ua", R.drawable.ic_phone, "UA：${settings.uaMode.label}") { showUaPicker() },
-                MenuItem("userscript", R.drawable.ic_extension, "油猴脚本") { showScriptManager() },
-                MenuItem("font", R.drawable.ic_find, "字体大小：${settings.fontScale}%") { showFontScale() },
-                MenuItem("orientation", R.drawable.ic_refresh, "屏幕方向：${orientationLabel()}") { showOrientation() },
-                MenuItem("adblock", R.drawable.ic_close, "广告拦截：${if (settings.adBlock) "开" else "关"}") { toggleAdBlock() },
-                MenuItem("debugweb", R.drawable.ic_code, "允许调试网页：${if (settings.debugWeb) "开" else "关"}") { toggleDebugWeb() },
-                MenuItem("lanapi", R.drawable.ic_link, "局域网 API：${if (settings.lanApiEnabled) "开" else "关"}") { toggleLanApi() },
-                MenuItem("menuconfig", R.drawable.ic_menu, "定制菜单") { showMenuConfig() },
-                MenuItem("history", R.drawable.ic_history, "历史记录") { showHistory() },
-                MenuItem("about", R.drawable.ic_info, "关于 / API") { showAbout() }
+            Pair("诊断工具", listOf(
+                MenuItem("sniff", R.drawable.ic_movie, "媒体嗅探", "识别 video / audio 与常见流媒体链接") { sniffMedia() },
+                MenuItem("resources", R.drawable.ic_folder, "页面资源", "查看图片、脚本和样式资源") { pageResources() },
+                MenuItem("source", R.drawable.ic_code, "源码归档", "导出 HTML、资源、Console 与网络日志") { downloadSourceZip() },
+                MenuItem("netlog", R.drawable.ic_network, "网络日志", "查看当前页面最近的请求状态") { showNetLog() },
+                MenuItem("devtools", R.drawable.ic_tools, "开发者工具", "诊断 API、Console 与页面状态") { devTools() },
+                MenuItem("qr", R.drawable.ic_qr, "页面二维码", "将当前地址生成二维码") { showQr() },
+                MenuItem("tts", R.drawable.ic_mic, "语音播报", "朗读页面主要文本内容") { speakPage() }
+            )),
+            Pair("浏览设置", listOf(
+                MenuItem("dark", R.drawable.ic_dark, "深色主题", if (isDark) "已开启" else "已关闭") { toggleDark() },
+                MenuItem("engine", R.drawable.ic_search, "搜索引擎", settings.engine.label) { showEnginePicker() },
+                MenuItem("ua", R.drawable.ic_phone, "User-Agent", settings.uaMode.label) { showUaPicker() },
+                MenuItem("userscript", R.drawable.ic_extension, "用户脚本", "${settings.getScripts().size} 个脚本") { showScriptManager() },
+                MenuItem("font", R.drawable.ic_font, "网页字体", "${settings.fontScale}%") { showFontScale() },
+                MenuItem("orientation", R.drawable.ic_rotate, "屏幕方向", orientationLabel()) { showOrientation() },
+                MenuItem("adblock", R.drawable.ic_shield, "广告拦截", if (settings.adBlock) "已开启" else "已关闭") { toggleAdBlock() },
+                MenuItem("debugweb", R.drawable.ic_code, "WebView 调试", if (settings.debugWeb) "已开启" else "已关闭") { toggleDebugWeb() }
+            )),
+            Pair("BrowserDiag", listOf(
+                MenuItem("lanapi", R.drawable.ic_link, "局域网诊断 API", if (settings.lanApiEnabled) "已开启 · Token 认证" else "已关闭 · 仅本机") { toggleLanApi() },
+                MenuItem("menuconfig", R.drawable.ic_settings, "定制功能菜单", "选择菜单中显示的功能") { showMenuConfig() },
+                MenuItem("about", R.drawable.ic_info, "关于 BrowserDiag", "v3.2.0 · API ${serverPort}") { showAbout() }
             ))
         )
         val filtered = groups.map { (title, items) -> title to items.filter { enabled(it.id) } }
             .filter { it.second.isNotEmpty() }
 
-        val scroll = ScrollView(this)
-        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        for ((groupTitle, items) in filtered) {
-            col.addView(TextView(this).apply {
-                text = groupTitle
-                textSize = 13f
-                setPadding(24, 14, 24, 6)
-                setTextColor(C_ACCENT)
-                setTypeface(null, android.graphics.Typeface.BOLD)
+        val currentTitle = tabs.current?.title.orEmpty().ifEmpty { displayHost(currentWeb()?.url.orEmpty()) }
+        val dialog = showBrowserSheet("BrowserDiag", currentTitle.take(72)) { content, sheet ->
+            val quick = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(1.dp(), 2.dp(), 1.dp(), 6.dp())
+            }
+            if (enabled("bookmark")) quick.addView(quickAction(R.drawable.ic_bookmark, "收藏") {
+                sheet.dismiss(); addCurrentToBookmarks()
             })
-            items.forEach { item ->
-                col.addView(menuRow(item.icon, item.label) {
-                    item.action()
-                })
+            if (enabled("find")) quick.addView(quickAction(R.drawable.ic_find, "查找") {
+                sheet.dismiss(); showFindBar()
+            })
+            if (enabled("share")) quick.addView(quickAction(R.drawable.ic_share, "分享") {
+                sheet.dismiss(); sharePage()
+            })
+            if (enabled("save")) quick.addView(quickAction(R.drawable.ic_save, "保存") {
+                sheet.dismiss(); savePage()
+            })
+            if (quick.childCount > 0) content.addView(quick)
+
+            filtered.forEach { (groupTitle, items) ->
+                content.addView(sectionTitle(groupTitle))
+                items.forEach { item ->
+                    content.addView(panelRow(item.icon, item.label, item.subtitle, onClick = {
+                        sheet.dismiss()
+                        item.action()
+                    }))
+                }
             }
         }
-        scroll.addView(col)
-        val dialog = AlertDialog.Builder(this)
-            .setTitle("功能菜单")
-            .setView(scroll)
-            .setNegativeButton("关闭", null)
-            .create()
         mainMenuDialog = dialog
         dialog.setOnDismissListener {
             if (mainMenuDialog === dialog) mainMenuDialog = null
         }
-        dialog.show()
     }
 
-    private class MenuItem(val id: String, val icon: Int, val label: String, val action: () -> Unit)
-
-    private fun menuRow(iconRes: Int, label: String, action: () -> Unit): LinearLayout =
-        LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(28, 12, 28, 12)
-            setBackgroundResource(android.R.drawable.list_selector_background)
-            isClickable = true
-            setOnClickListener {
-                mainMenuDialog?.dismiss()
-                action()
-            }
-            addView(ImageView(this@MainActivity).apply {
-                setImageResource(iconRes)
-                setColorFilter(if (isDark) C_TEXT_DARK else 0xFF374151.toInt())
-                layoutParams = LinearLayout.LayoutParams(28.dp(), 28.dp())
-            })
-            addView(TextView(this@MainActivity).apply {
-                text = label
-                textSize = 15f
-                setTextColor(if (isDark) C_TEXT_DARK else C_TEXT_LIGHT)
-                setPadding(18, 0, 0, 0)
-                layoutParams = LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-                )
-            })
-        }
+    private class MenuItem(
+        val id: String,
+        val icon: Int,
+        val label: String,
+        val subtitle: String = "",
+        val action: () -> Unit
+    )
 
     // ==================== 书签 ====================
     private fun showBookmarks() {
         val bookmarks = settings.getBookmarks()
-        if (bookmarks.isEmpty()) {
-            addCurrentToBookmarks()
-            return
-        }
-        val labels = bookmarks.map { (n, u) ->
-            val t = n.ifEmpty { u }
-            if (t.length > 34) t.take(34) + "…" else t
-        }.toTypedArray()
-        AlertDialog.Builder(this)
-            .setTitle("书签")
-            .setItems(labels) { _, which ->
-                currentWeb()?.loadUrl(bookmarks[which].second)
+        showBrowserSheet(
+            title = "书签",
+            subtitle = if (bookmarks.isEmpty()) "保存常用网页，随时快速访问" else "${bookmarks.size} 个已收藏页面",
+            headerActionLabel = "＋ 收藏当前页",
+            headerAction = { dialog ->
+                addCurrentToBookmarks()
+                dialog.dismiss()
             }
-            .setPositiveButton("☆ 收藏当前页") { _, _ -> addCurrentToBookmarks() }
-            .setNeutralButton("删除") { _, _ ->
-                AlertDialog.Builder(this)
-                    .setTitle("删除书签")
-                    .setItems(labels) { _, which ->
-                        settings.removeBookmark(bookmarks[which].second)
-                        toast("已删除")
+        ) { content, dialog ->
+            if (bookmarks.isEmpty()) {
+                content.addView(emptyPanel(R.drawable.ic_bookmark, "还没有书签", "打开网页后点击“收藏当前页”即可保存"))
+            }
+            bookmarks.forEach { (name, url) ->
+                content.addView(panelRow(
+                    iconRes = R.drawable.ic_bookmark,
+                    title = name.ifEmpty { displayHost(url) }.take(72),
+                    subtitle = displayHost(url),
+                    trailingIcon = R.drawable.ic_delete,
+                    onTrailing = {
+                        settings.removeBookmark(url)
+                        toast("书签已删除")
+                        dialog.dismiss()
+                    },
+                    onClick = {
+                        currentWeb()?.loadUrl(url)
+                        dialog.dismiss()
                     }
-                    .setNegativeButton("取消", null)
-                    .show()
+                ))
             }
-            .setNegativeButton("关闭", null)
-            .show()
+        }
     }
 
     private fun addCurrentToBookmarks() {
@@ -733,7 +1173,7 @@ class MainActivity : AppCompatActivity() {
         val url = currentWeb()?.url ?: return
         val tUrl = "https://translate.google.com/translate?u=" + URLEncoder.encode(url, "UTF-8")
         currentWeb()?.loadUrl(tUrl)
-        urlInput.setText(tUrl)
+        setOmniboxUrl(tUrl)
     }
 
     // ==================== 媒体嗅探 / 页面资源 ====================
@@ -752,7 +1192,9 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread {
                 if (list.isEmpty()) {
                     statusBar.text = "未发现媒体资源"
-                    toast("未发现媒体资源")
+                    showBrowserSheet("媒体嗅探", "扫描 video / audio 与常见媒体请求") { content, _ ->
+                        content.addView(emptyPanel(R.drawable.ic_movie, "未发现媒体资源", "播放页面中的视频或音频后可再次扫描"))
+                    }
                     return@runOnUiThread
                 }
                 statusBar.text = "发现 ${list.size} 个媒体资源"
@@ -773,22 +1215,29 @@ class MainActivity : AppCompatActivity() {
                 emptyList()
             }
             runOnUiThread {
-                if (list.isEmpty()) toast("未发现资源") else showUrlListDialog("页面资源（点击打开）", list)
+                if (list.isEmpty()) {
+                    showBrowserSheet("页面资源", "图片、脚本与样式资源") { content, _ ->
+                        content.addView(emptyPanel(R.drawable.ic_folder, "未发现页面资源", "当前页面没有可列出的外部资源"))
+                    }
+                } else {
+                    showUrlListDialog("页面资源", list)
+                }
             }
         }
     }
 
     private fun showUrlListDialog(title: String, urls: List<String>) {
-        val labels = urls.map { if (it.length > 60) it.take(60) + "…" else it }.toTypedArray()
-        AlertDialog.Builder(this)
-            .setTitle("$title（${urls.size}）")
-            .setItems(labels) { _, which ->
-                val url = urls[which]
+        showBrowserSheet(title, "${urls.size} 个资源 · 点击选择操作") { content, sheet ->
+            urls.forEach { url ->
+                content.addView(panelRow(R.drawable.ic_link, displayHost(url), url.take(120), onClick = {
                 AlertDialog.Builder(this)
                     .setTitle("操作")
-                    .setItems(arrayOf("在浏览器中打开", "下载", "复制链接")) { _, op ->
+                    .setItems(arrayOf("在当前标签打开", "下载资源", "复制链接")) { actionDialog, op ->
                         when (op) {
-                            0 -> currentWeb()?.loadUrl(url)
+                            0 -> {
+                                currentWeb()?.loadUrl(url)
+                                sheet.dismiss()
+                            }
                             1 -> {
                                 try {
                                     val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
@@ -800,17 +1249,14 @@ class MainActivity : AppCompatActivity() {
                                     toast("下载失败：${e.message}")
                                 }
                             }
-                            2 -> {
-                                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                cm.setPrimaryClip(ClipData.newPlainText("url", url))
-                                toast("已复制链接")
-                            }
+                            2 -> copyText(url)
                         }
+                        actionDialog.dismiss()
                     }
                     .show()
+                }))
             }
-            .setNegativeButton("关闭", null)
-            .show()
+        }
     }
 
     // ==================== 语音播报 ====================
@@ -916,25 +1362,73 @@ class MainActivity : AppCompatActivity() {
         val api = apiBaseUrl()
         val token = settings.apiToken
         val wv = currentWeb()
-        AlertDialog.Builder(this)
-            .setTitle("开发者工具")
-            .setMessage(
-                "HTTP API：$api\n" +
-                    "访问范围：${if (settings.lanApiEnabled) "局域网 + 本机" else "仅本机"}\n" +
-                    "认证：Bearer ${token.take(6)}…${token.takeLast(4)}\n" +
-                    "工具：browser_open/state/console/network/eval/screenshot/perf/report/source/close\n\n" +
-                    "当前标签：${wv?.url ?: "无"}\n" +
-                    "console 日志：${consoleLogs.size}（错误 ${consoleLogs.filter { it.optString("type") == "error" }.size}）\n\n" +
-                    "提示：HTTP 请求必须携带 Authorization: Bearer <token>。"
-            )
-            .setPositiveButton("复制 API 地址") { _, _ ->
-                copyText(api)
+        val errors = synchronized(consoleLogs) { consoleLogs.count { it.optString("type") == "error" } }
+        showBrowserSheet("开发者工具", "BrowserDiag 页面诊断控制台") { content, dialog ->
+            content.addView(sectionTitle("连接"))
+            content.addView(panelRow(
+                R.drawable.ic_network,
+                "诊断 API",
+                "$api · ${if (settings.lanApiEnabled) "局域网 + 本机" else "仅本机"}",
+                onClick = { copyText(api) }
+            ))
+            content.addView(panelRow(
+                R.drawable.ic_lock,
+                "访问 Token",
+                "${token.take(6)}…${token.takeLast(4)} · 点击复制完整 Token",
+                onClick = { copyText(token) }
+            ))
+            content.addView(sectionTitle("当前页面"))
+            content.addView(panelRow(
+                R.drawable.ic_tab,
+                tabs.current?.title.orEmpty().ifEmpty { "当前标签" }.take(72),
+                wv?.url.orEmpty().take(140)
+            ))
+            content.addView(panelRow(
+                R.drawable.ic_code,
+                "Console",
+                "${consoleLogs.size} 条日志 · $errors 条错误",
+                onClick = {
+                    dialog.dismiss()
+                    showConsoleLog()
+                }
+            ))
+            content.addView(panelRow(
+                R.drawable.ic_network,
+                "Network",
+                "查看当前页面最近的请求、状态码与资源地址",
+                onClick = {
+                    dialog.dismiss()
+                    showNetLog()
+                }
+            ))
+            content.addView(TextView(this).apply {
+                text = "HTTP 调用必须携带 Authorization: Bearer <token>。支持页面状态、Console、Network、Eval、截图、性能、报告、源码等诊断能力。"
+                textSize = 12.5f
+                setTextColor(secondaryTextColor())
+                setPadding(14.dp(), 16.dp(), 14.dp(), 8.dp())
+            })
+        }
+    }
+
+    private fun showConsoleLog() {
+        val logs = synchronized(consoleLogs) { consoleLogs.takeLast(120).reversed() }
+        val errors = logs.count { it.optString("type") == "error" }
+        showBrowserSheet("Console", "${logs.size} 条最近日志 · $errors 条错误") { content, _ ->
+            if (logs.isEmpty()) {
+                content.addView(emptyPanel(R.drawable.ic_code, "暂无 Console 日志", "页面脚本输出会显示在这里"))
             }
-            .setNeutralButton("复制 API Token") { _, _ ->
-                copyText(token)
+            logs.forEach { entry ->
+                val type = entry.optString("type").ifEmpty { "log" }.uppercase(Locale.ROOT)
+                val message = entry.optString("text")
+                content.addView(panelRow(
+                    R.drawable.ic_code,
+                    type,
+                    message.take(180),
+                    selected = type == "ERROR",
+                    onClick = { copyText(message) }
+                ))
             }
-            .setNegativeButton("关闭", null)
-            .show()
+        }
     }
 
     // ==================== 深色主题 / 引擎 / UA / 油猴 / 历史 / 关于 ====================
@@ -947,90 +1441,134 @@ class MainActivity : AppCompatActivity() {
 
     private fun showEnginePicker() {
         val engines = SearchEngine.entries
-        val labels = engines.map { it.label }.toTypedArray()
-        val current = engines.indexOfFirst { it == settings.engine }
-        AlertDialog.Builder(this)
-            .setTitle("搜索引擎")
-            .setSingleChoiceItems(labels, current) { d, which ->
-                settings.engine = engines[which]
-                d.dismiss()
-                toast("已切换：${engines[which].label}")
+        val current = settings.engine
+        showBrowserSheet("搜索引擎", "当前：${current.label}") { content, dialog ->
+            engines.forEach { engine ->
+                content.addView(panelRow(
+                    R.drawable.ic_search,
+                    engine.label,
+                    displayHost(engine.searchUrl),
+                    selected = engine == current,
+                    onClick = {
+                        settings.engine = engine
+                        statusBar.text = buildStatusText()
+                        dialog.dismiss()
+                        toast("搜索引擎已切换为 ${engine.label}")
+                    }
+                ))
             }
-            .show()
+        }
     }
 
     private fun showUaPicker() {
         val modes = UaMode.entries
-        val labels = modes.map { it.label }.toTypedArray()
-        val current = modes.indexOfFirst { it == settings.uaMode }
-        AlertDialog.Builder(this)
-            .setTitle("User-Agent")
-            .setSingleChoiceItems(labels, current) { d, which ->
-                settings.uaMode = modes[which]
-                currentWeb()?.settings?.userAgentString =
-                    modes[which].uaString(WebSettings.getDefaultUserAgent(this))
-                d.dismiss()
-                toast("UA 已切换：${modes[which].label}（刷新页面生效）")
+        val current = settings.uaMode
+        showBrowserSheet("User-Agent", "当前：${current.label}") { content, dialog ->
+            modes.forEach { mode ->
+                val description = when (mode) {
+                    UaMode.ANDROID -> "使用系统 WebView 默认移动端标识"
+                    UaMode.DESKTOP -> "模拟桌面 Chrome 页面布局"
+                    UaMode.IPHONE -> "模拟 iPhone Safari 页面布局"
+                }
+                content.addView(panelRow(
+                    R.drawable.ic_phone,
+                    mode.label,
+                    description,
+                    selected = mode == current,
+                    onClick = {
+                        settings.uaMode = mode
+                        val ua = mode.uaString(WebSettings.getDefaultUserAgent(this))
+                        tabs.all.forEach { it.webView.settings.userAgentString = ua }
+                        statusBar.text = buildStatusText()
+                        dialog.dismiss()
+                        toast("UA 已切换为 ${mode.label}，刷新标签页后生效")
+                    }
+                ))
             }
-            .show()
+        }
     }
 
     private fun showScriptManager() {
         val scripts = settings.getScripts()
-        if (scripts.isEmpty()) {
-            AlertDialog.Builder(this)
-                .setTitle("油猴脚本")
-                .setMessage("暂无脚本\n\n点击下方按钮添加脚本")
-                .setPositiveButton("添加") { _, _ -> showAddScriptDialog() }
-                .setNegativeButton("关闭", null)
-                .show()
-            return
-        }
-        val labels = scripts.map { s ->
-            val state = if (s.enabled) "✅" else "⛔"
-            "$state ${s.name}  (${s.urlPattern})"
-        }.toTypedArray()
-        AlertDialog.Builder(this)
-            .setTitle("油猴脚本（点击切换启用/停用）")
-            .setItems(labels) { _, which ->
-                val list = settings.getScripts().toMutableList()
-                list[which] = list[which].copy(enabled = !list[which].enabled)
-                settings.saveScripts(list)
-                toast("脚本已${if (list[which].enabled) "启用" else "停用"}，应用重载中…")
-                recreate()
+        showBrowserSheet(
+            title = "用户脚本",
+            subtitle = "${scripts.size} 个脚本 · 新标签页加载启用脚本",
+            headerActionLabel = "＋ 添加",
+            headerAction = { dialog ->
+                dialog.dismiss()
+                showAddScriptDialog()
             }
-            .setPositiveButton("添加脚本") { _, _ -> showAddScriptDialog() }
-            .setNegativeButton("关闭", null)
-            .show()
+        ) { content, dialog ->
+            if (scripts.isEmpty()) {
+                content.addView(emptyPanel(R.drawable.ic_extension, "暂无用户脚本", "添加脚本后可按 URL 规则自动注入页面"))
+            }
+            scripts.forEachIndexed { index, script ->
+                content.addView(panelRow(
+                    iconRes = R.drawable.ic_extension,
+                    title = script.name,
+                    subtitle = "${if (script.enabled) "已启用" else "已停用"} · ${script.urlPattern}",
+                    trailingIcon = R.drawable.ic_delete,
+                    selected = script.enabled,
+                    onTrailing = {
+                        val updated = settings.getScripts().toMutableList()
+                        if (index in updated.indices) updated.removeAt(index)
+                        settings.saveScripts(updated)
+                        toast("脚本已删除")
+                        dialog.dismiss()
+                    },
+                    onClick = {
+                        val updated = settings.getScripts().toMutableList()
+                        if (index in updated.indices) {
+                            updated[index] = updated[index].copy(enabled = !updated[index].enabled)
+                            settings.saveScripts(updated)
+                            toast("脚本已${if (updated[index].enabled) "启用" else "停用"}，新标签页后生效")
+                        }
+                        dialog.dismiss()
+                    }
+                ))
+            }
+        }
     }
 
     private fun showAddScriptDialog() {
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(40, 20, 40, 0)
+            setPadding(24.dp(), 8.dp(), 24.dp(), 0)
         }
-        val nameInput = EditText(this).apply { hint = "脚本名称" }
+        val nameInput = EditText(this).apply {
+            hint = "脚本名称"
+            setSingleLine(true)
+        }
         val patternInput = EditText(this).apply {
             hint = "匹配规则（* 全部，如 *youtube.com*）"
             setText("*")
+            setSingleLine(true)
         }
         val codeInput = EditText(this).apply {
             hint = "脚本代码（IIFE 形式）"
             gravity = Gravity.TOP
-            minLines = 6
+            minLines = 8
+            textSize = 13f
+            typeface = android.graphics.Typeface.MONOSPACE
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
         }
         container.addView(nameInput)
         container.addView(patternInput)
         container.addView(codeInput)
-        AlertDialog.Builder(this)
+        val dialog = AlertDialog.Builder(this)
             .setTitle("添加油猴脚本")
             .setView(container)
-            .setPositiveButton("保存") { _, _ ->
+            .setPositiveButton("保存", null)
+            .setNegativeButton("取消", null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(android.content.DialogInterface.BUTTON_POSITIVE).setOnClickListener {
                 val name = nameInput.text.toString().trim()
                 val code = codeInput.text.toString().trim()
                 if (name.isEmpty() || code.isEmpty()) {
                     toast("名称和代码不能为空")
-                    return@setPositiveButton
+                    return@setOnClickListener
                 }
                 val list = settings.getScripts().toMutableList()
                 list.add(
@@ -1043,60 +1581,62 @@ class MainActivity : AppCompatActivity() {
                     )
                 )
                 settings.saveScripts(list)
-                toast("脚本已添加，应用重载中…")
-                recreate()
+                toast("脚本已添加，新标签页或下次启动后生效")
+                dialog.dismiss()
             }
-            .setNegativeButton("取消", null)
-            .show()
+        }
+        dialog.show()
     }
 
     private fun showHistory() {
         val history = settings.getHistory()
-        if (history.isEmpty()) {
-            AlertDialog.Builder(this)
-                .setTitle("历史记录")
-                .setMessage("暂无记录")
-                .setNegativeButton("关闭", null)
-                .show()
-            return
-        }
-        val labels = history.map { (url, title) ->
-            val t = title.ifEmpty { url }
-            if (t.length > 40) t.take(40) + "…" else t
-        }.toTypedArray()
-        AlertDialog.Builder(this)
-            .setTitle("最近访问（${history.size}）")
-            .setItems(labels) { _, which ->
-                currentWeb()?.loadUrl(history[which].first)
-            }
-            .setPositiveButton("清空") { _, _ ->
+        showBrowserSheet(
+            title = "历史记录",
+            subtitle = if (history.isEmpty()) "最近访问的网页会显示在这里" else "最近 ${history.size} 条访问记录",
+            headerActionLabel = if (history.isEmpty()) null else "清空",
+            headerAction = if (history.isEmpty()) null else { dialog ->
                 settings.clearHistory()
                 toast("历史已清空")
+                dialog.dismiss()
             }
-            .setNegativeButton("关闭", null)
-            .show()
+        ) { content, dialog ->
+            if (history.isEmpty()) {
+                content.addView(emptyPanel(R.drawable.ic_history, "暂无历史记录", "你的浏览记录只保存在本机"))
+            }
+            history.forEach { (url, title) ->
+                content.addView(panelRow(
+                    R.drawable.ic_history,
+                    title.ifEmpty { displayHost(url) }.take(72),
+                    displayHost(url),
+                    onClick = {
+                        currentWeb()?.loadUrl(url)
+                        dialog.dismiss()
+                    }
+                ))
+            }
+        }
     }
 
     private fun showAbout() {
         val api = apiBaseUrl()
         val token = settings.apiToken
         val ua = currentWeb()?.settings?.userAgentString ?: ""
-        AlertDialog.Builder(this)
-            .setTitle("BrowserDiag")
-            .setMessage(
-                "版本：3.2.0\n" +
-                    "HTTP API：$api（Token 认证）\n" +
-                    "功能：多标签 / 搜索引擎 / UA / 深色主题 / 油猴 / 书签 / 源码打包 / 嗅探 / 二维码 / 语音等\n" +
-                    "\n当前 UA：\n${ua.take(120)}"
-            )
-            .setPositiveButton("复制 API 地址") { _, _ ->
+        showBrowserSheet("BrowserDiag", "安全浏览 + 页面诊断 · v3.2.0") { content, _ ->
+            content.addView(panelRow(R.drawable.ic_info, "BrowserDiag 3.2.0", "Android 浏览器与诊断后端"))
+            content.addView(panelRow(R.drawable.ic_network, "HTTP API", "$api · Token 认证", onClick = {
                 copyText(api)
-            }
-            .setNeutralButton("复制 API Token") { _, _ ->
+            }))
+            content.addView(panelRow(R.drawable.ic_lock, "API Token", "${token.take(6)}…${token.takeLast(4)} · 点击复制", onClick = {
                 copyText(token)
-            }
-            .setNegativeButton("关闭", null)
-            .show()
+            }))
+            content.addView(panelRow(R.drawable.ic_phone, "当前 User-Agent", ua.take(150)))
+            content.addView(TextView(this).apply {
+                text = "多标签浏览、搜索引擎、UA、用户脚本、书签、源码归档、媒体嗅探、网络日志、二维码、语音与远程诊断能力均在本机统一提供。"
+                textSize = 12.5f
+                setTextColor(secondaryTextColor())
+                setPadding(14.dp(), 16.dp(), 14.dp(), 8.dp())
+            })
+        }
     }
 
     // ==================== 源码 zip（保留 v2.1） ====================
@@ -1182,12 +1722,15 @@ class MainActivity : AppCompatActivity() {
             topBar.visibility = View.VISIBLE
             bottomBar.visibility = View.VISIBLE
             statusBar.visibility = View.VISIBLE
+            pageProgress.visibility = if ((currentWeb()?.progress ?: 100) in 1..99) View.VISIBLE else View.GONE
             window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
+            applyTheme()
         } else {
             if (findBar.visibility == View.VISIBLE) hideFindBar()
             topBar.visibility = View.GONE
             bottomBar.visibility = View.GONE
             statusBar.visibility = View.GONE
+            pageProgress.visibility = View.GONE
             window.decorView.systemUiVisibility =
                 View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
                 View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
@@ -1199,21 +1742,25 @@ class MainActivity : AppCompatActivity() {
         val wv = currentWeb() ?: return toast("无页面")
         wv.evaluateJavascript("JSON.stringify((window.__bdNet||[]).slice(-100).reverse())") { raw ->
             val arr = decodeJsArray(raw)
-            if (arr.length() == 0) { toast("暂无网络请求记录"); return@evaluateJavascript }
-            val lines = (0 until arr.length()).map { i ->
-                val o = arr.optJSONObject(i)
-                val status = o.optInt("status")
-                val color = if (status in 200..399) "🟢" else if (status == 0) "🔴" else "🟡"
-                "$color ${o.optString("method")} $status  ${o.optString("url")}"
-            }
-            AlertDialog.Builder(this)
-                .setTitle("网络日志（${arr.length()} 条）")
-                .setItems(lines.toTypedArray()) { _, idx ->
-                    val o = arr.optJSONObject(idx)
-                    copyText(o.optString("url"))
+            showBrowserSheet("网络日志", "当前页面最近 ${arr.length()} 条请求 · 点击复制 URL") { content, _ ->
+                if (arr.length() == 0) {
+                    content.addView(emptyPanel(R.drawable.ic_network, "暂无网络记录", "刷新或浏览页面后再查看请求"))
                 }
-                .setNegativeButton("关闭", null)
-            .show()
+                for (idx in 0 until arr.length()) {
+                    val o = arr.optJSONObject(idx) ?: continue
+                    val status = o.optInt("status")
+                    val method = o.optString("method").ifEmpty { "GET" }
+                    val state = when {
+                        status in 200..399 -> "$method $status · 成功"
+                        status == 0 -> "$method · 进行中或失败"
+                        else -> "$method $status · 异常"
+                    }
+                    val url = o.optString("url")
+                    content.addView(panelRow(R.drawable.ic_network, state, url.take(140), onClick = {
+                        copyText(url)
+                    }))
+                }
+            }
         }
     }
 
@@ -1243,7 +1790,9 @@ class MainActivity : AppCompatActivity() {
         val cursor: Cursor? = try { dm.query(q) } catch (e: Exception) { null }
         if (cursor == null || !cursor.moveToFirst()) {
             cursor?.close()
-            toast("暂无下载记录")
+            showBrowserSheet("下载内容", "系统 DownloadManager") { content, _ ->
+                content.addView(emptyPanel(R.drawable.ic_download, "暂无下载记录", "从网页下载的文件会显示在这里"))
+            }
             return
         }
         val names = mutableListOf<String>()
@@ -1265,29 +1814,33 @@ class MainActivity : AppCompatActivity() {
             ids.add(id)
         } while (cursor.moveToNext())
         cursor.close()
-        AlertDialog.Builder(this)
-            .setTitle("下载管理（${names.size} 个）")
-            .setItems(names.toTypedArray()) { _, idx ->
-                val uri = dm.getUriForDownloadedFile(ids[idx])
-                if (uri == null) {
-                    toast("该下载尚不可打开")
-                    return@setItems
-                }
-                try {
-                    val mime = dm.getMimeTypeForDownloadedFile(ids[idx]) ?: "*/*"
-                    startActivity(
-                        Intent(Intent.ACTION_VIEW)
-                            .setDataAndType(uri, mime)
-                            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                    )
-                } catch (_: ActivityNotFoundException) {
-                    toast("无法打开该文件")
-                } catch (_: SecurityException) {
-                    toast("无法打开该文件")
-                }
+        showBrowserSheet("下载内容", "${names.size} 个下载任务") { content, dialog ->
+            names.forEachIndexed { idx, label ->
+                val split = label.split(" · ", limit = 2)
+                val state = split.firstOrNull().orEmpty()
+                val title = split.getOrNull(1).orEmpty().ifEmpty { label }
+                content.addView(panelRow(R.drawable.ic_download, title, state, onClick = {
+                    val uri = dm.getUriForDownloadedFile(ids[idx])
+                    if (uri == null) {
+                        toast("该下载尚不可打开")
+                    } else {
+                        try {
+                            val mime = dm.getMimeTypeForDownloadedFile(ids[idx]) ?: "*/*"
+                            startActivity(
+                                Intent(Intent.ACTION_VIEW)
+                                    .setDataAndType(uri, mime)
+                                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            )
+                            dialog.dismiss()
+                        } catch (_: ActivityNotFoundException) {
+                            toast("无法打开该文件")
+                        } catch (_: SecurityException) {
+                            toast("无法打开该文件")
+                        }
+                    }
+                }))
             }
-            .setNegativeButton("关闭", null)
-            .show()
+        }
     }
 
     /** 广告拦截开关：持久化 + 刷新当前页生效 */
@@ -1320,16 +1873,26 @@ class MainActivity : AppCompatActivity() {
         val options = arrayOf("50%", "75%", "100%", "125%", "150%", "175%", "200%")
         val values = intArrayOf(50, 75, 100, 125, 150, 175, 200)
         val current = settings.fontScale
-        val checked = values.indexOfFirst { it == current }.coerceAtLeast(0)
-        AlertDialog.Builder(this)
-            .setTitle("字体大小（当前 ${current}%）")
-            .setSingleChoiceItems(options, checked) { _, which ->
-                settings.fontScale = values[which]
-                tabs.all.forEach { it.webView.settings.textZoom = values[which] }
-                toast("字体已调整为 ${values[which]}%")
+        showBrowserSheet("网页字体", "当前缩放 ${current}%") { content, dialog ->
+            values.forEachIndexed { index, value ->
+                content.addView(panelRow(
+                    R.drawable.ic_font,
+                    options[index],
+                    when {
+                        value < 100 -> "缩小网页文字"
+                        value == 100 -> "网站默认比例"
+                        else -> "放大网页文字"
+                    },
+                    selected = value == current,
+                    onClick = {
+                        settings.fontScale = value
+                        tabs.all.forEach { it.webView.settings.textZoom = value }
+                        dialog.dismiss()
+                        toast("网页字体已调整为 $value%")
+                    }
+                ))
             }
-            .setNegativeButton("关闭", null)
-            .show()
+        }
     }
 
     private fun orientationLabel(): String = when (settings.screenOrientation) {
@@ -1340,27 +1903,32 @@ class MainActivity : AppCompatActivity() {
 
     /** 屏幕方向：自动 / 竖屏 / 横屏 */
     private fun showOrientation() {
-        val options = arrayOf("自动旋转", "竖屏锁定", "横屏锁定")
-        val checked = when (settings.screenOrientation) {
-            "portrait" -> 1
-            "landscape" -> 2
-            else -> 0
-        }
-        AlertDialog.Builder(this)
-            .setTitle("屏幕方向")
-            .setSingleChoiceItems(options, checked) { _, which ->
-                settings.screenOrientation = when (which) {
-                    1 -> "portrait"; 2 -> "landscape"; else -> "auto"
-                }
-                requestedOrientation = when (which) {
-                    1 -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-                    2 -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-                    else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-                }
-                toast("屏幕方向：${options[which]}")
+        val modes = listOf(
+            Triple("auto", "自动旋转", "跟随设备方向"),
+            Triple("portrait", "竖屏锁定", "始终使用纵向浏览布局"),
+            Triple("landscape", "横屏锁定", "始终使用横向浏览布局")
+        )
+        val current = settings.screenOrientation
+        showBrowserSheet("屏幕方向", "当前：${orientationLabel()}") { content, dialog ->
+            modes.forEach { (value, label, description) ->
+                content.addView(panelRow(
+                    R.drawable.ic_rotate,
+                    label,
+                    description,
+                    selected = value == current,
+                    onClick = {
+                        settings.screenOrientation = value
+                        requestedOrientation = when (value) {
+                            "portrait" -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                            "landscape" -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                            else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                        }
+                        dialog.dismiss()
+                        toast("屏幕方向：$label")
+                    }
+                ))
             }
-            .setNegativeButton("关闭", null)
-            .show()
+        }
     }
 
     /** 定制菜单：菜单项显隐开关（持久化） */
@@ -1376,30 +1944,30 @@ class MainActivity : AppCompatActivity() {
             "lanapi" to "局域网 API", "history" to "历史记录"
         )
         val cfg = settings.getMenuConfig().toMutableMap()
-        val scroll = ScrollView(this)
-        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        allItems.forEach { (id, label) ->
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(24, 6, 24, 6)
+        showBrowserSheet(
+            title = "定制功能菜单",
+            subtitle = "关于与本项始终显示",
+            headerActionLabel = "保存",
+            headerAction = { dialog ->
+                settings.setMenuConfig(cfg)
+                toast("功能菜单已更新")
+                dialog.dismiss()
             }
-            val cb = android.widget.CheckBox(this).apply {
-                text = label
-                textSize = 15f
-                isChecked = cfg[id] != false
-                setOnCheckedChangeListener { _, isChecked -> cfg[id] = isChecked }
+        ) { content, _ ->
+            allItems.forEach { (id, label) ->
+                content.addView(MaterialSwitch(this).apply {
+                    text = label
+                    textSize = 14.5f
+                    setTextColor(textColor())
+                    isChecked = cfg[id] != false
+                    setPadding(14.dp(), 7.dp(), 14.dp(), 7.dp())
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                    )
+                    setOnCheckedChangeListener { _, isChecked -> cfg[id] = isChecked }
+                })
             }
-            row.addView(cb)
-            col.addView(row)
         }
-        scroll.addView(col)
-        AlertDialog.Builder(this)
-            .setTitle("定制菜单（关于与本项始终显示）")
-            .setView(scroll)
-            .setPositiveButton("保存") { _, _ -> settings.setMenuConfig(cfg); toast("菜单已更新") }
-            .setNegativeButton("取消", null)
-            .show()
     }
 
     private fun copyText(text: String) {
