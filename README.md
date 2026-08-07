@@ -5,7 +5,7 @@
 1. **MCP 插件**（`mcp-server/`）：Node.js 实现，可注册到任意支持 MCP 的 AI 平台，通过 stdio/HTTP 提供浏览器自动化诊断。
 2. **独立 Android APK**（`android/`）：WebView 浏览器 + 内嵌 HTTP 诊断服务器，**供不支持安装插件的 AI 工具直接通过 HTTP 调用**（手机与电脑同一局域网即可）。
 
-## 核心能力（24 个诊断工具）
+## 核心能力（24 个诊断工具 + 浏览器功能）
 
 | 类别 | 工具 |
 |---|---|
@@ -13,8 +13,23 @@
 | 交互操作 | `browser_click` `browser_click_at` `browser_type` `browser_keyboard` `browser_wheel` |
 | 信息采集 | `browser_console` `browser_network` `browser_dom` `browser_links` `browser_screenshot` `browser_save` |
 | 代码执行 | `browser_eval` `browser_run`（脚本化多步流程） |
-| 高级诊断 | `browser_perf`（TTFB/加载时序/慢资源） `browser_assert`（断言检查） `browser_report`（一键诊断报告） `browser_route`（请求拦截 mock） |
+| 高级诊断 | `browser_perf`（TTFB/加载时序/慢资源） `browser_assert`（断言检查） `browser_report`（一键诊断报告） `browser_route`（请求拦截 mock） `browser_source`（页面源码） |
 | Flutter 辅助 | `browser_flutter`（语义树启用/节点查询/按 label 点击） |
+
+## 独立 APK 浏览器功能（v2.1）
+
+| 功能 | 说明 |
+|---|---|
+| **底部导航栏** | 🏠主页 / ◀后退 / ▶前进 / ⟳刷新 / ☰菜单 |
+| **地址/搜索合一** | 输入 URL 直接访问，输入关键词走当前搜索引擎 |
+| **搜索引擎切换** | Google / Bing / 百度 / 搜狗 / DuckDuckGo（持久化） |
+| **UA 切换** | Android 默认 / 桌面 Chrome / iPhone Safari（持久化） |
+| **油猴脚本** | document-start 级注入，支持 URL 匹配规则、启用/停用、添加脚本 |
+| **网页源码打包** | 当前页 HTML + 页面信息 + console/network 日志 + 静态资源 → zip 保存到「下载」 |
+| **历史记录** | 最近 50 条访问记录，一键清空 |
+| **文件下载** | 系统 DownloadManager 接管下载 |
+| **缩放浏览** | 双指缩放 / 双击缩放 |
+| **诊断 API** | 内嵌 :8788 HTTP 服务器，供 AI 工具调用（状态栏显示地址） |
 
 ## 快速开始
 
