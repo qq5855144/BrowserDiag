@@ -1,8 +1,42 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.BrowserDiag" parent="Theme.AppCompat.DayNight.NoActionBar">
-        <item name="android:statusBarColor">#1E293B</item>
-        <item name="android:navigationBarColor">#1E293B</item>
-        <item name="android:windowBackground">#F8FAFC</item>
+    <style name="Theme.BrowserDiag" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">#0B57D0</item>
+        <item name="colorOnPrimary">#FFFFFF</item>
+        <item name="colorSecondary">#0B57D0</item>
+        <item name="colorSurface">#F8FAFD</item>
+        <item name="colorOnSurface">#1F1F1F</item>
+        <item name="colorSurfaceVariant">#E9EEF6</item>
+        <item name="colorOnSurfaceVariant">#5F6368</item>
+        <item name="android:statusBarColor">#F8FAFD</item>
+        <item name="android:navigationBarColor">#F1F3F4</item>
+        <item name="android:windowBackground">#F8FAFD</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#0B57D0</item>
+    </style>
+
+    <style name="ThemeOverlay.BrowserDiag.Light">
+        <item name="colorPrimary">#0B57D0</item>
+        <item name="colorOnPrimary">#FFFFFF</item>
+        <item name="colorSurface">#F8FAFD</item>
+        <item name="colorOnSurface">#1F1F1F</item>
+        <item name="colorSurfaceVariant">#E9EEF6</item>
+        <item name="colorOnSurfaceVariant">#5F6368</item>
+        <item name="android:textColorPrimary">#1F1F1F</item>
+        <item name="android:textColorSecondary">#5F6368</item>
+        <item name="android:colorAccent">#0B57D0</item>
+    </style>
+
+    <style name="ThemeOverlay.BrowserDiag.Dark">
+        <item name="colorPrimary">#8AB4F8</item>
+        <item name="colorOnPrimary">#062E6F</item>
+        <item name="colorSurface">#202124</item>
+        <item name="colorOnSurface">#E8EAED</item>
+        <item name="colorSurfaceVariant">#303134</item>
+        <item name="colorOnSurfaceVariant">#BDC1C6</item>
+        <item name="android:textColorPrimary">#E8EAED</item>
+        <item name="android:textColorSecondary">#BDC1C6</item>
+        <item name="android:colorAccent">#8AB4F8</item>
     </style>
 </resources>
