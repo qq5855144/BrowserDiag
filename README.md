@@ -1,120 +1,124 @@
-# BrowserDiag — 浏览器诊断工具（MCP 插件 + 独立 APK）
+# BrowserDiag v3.2
 
-面向 AI 的 Web 应用诊断工具，**两种形态，同一套诊断能力**：
+BrowserDiag 是面向 AI 与开发者的 Web 浏览器诊断工具，包含两个运行形态：
 
-1. **MCP 插件**（`mcp-server/`）：Node.js 实现，可注册到任意支持 MCP 的 AI 平台，通过 stdio/HTTP 提供浏览器自动化诊断。
-2. **独立 Android APK**（`android/`）：WebView 浏览器 + 内嵌 HTTP 诊断服务器，**供不支持安装插件的 AI 工具直接通过 HTTP 调用**（手机与电脑同一局域网即可）。
+1. **Node MCP 服务**（`mcp-server/`）：提供 MCP stdio、CLI 和带 Token 认证的 HTTP 模式，基于 Playwright/Chromium。
+2. **Android APK**（`android/`）：独立 WebView 浏览器，内置本机诊断 HTTP API，可按需开启局域网访问。
 
-## 核心能力（24 个诊断工具 + 浏览器功能）
+## v3.2 质量增强
+
+- 修复 APK 启动时 `Tabs` 未初始化以及首次切换使用 `-1` 下标导致的确定性崩溃。
+- 修复 Android `evaluateJavascript` 返回值二次 JSON 编码导致 state/network/perf/text 等接口解析失败。
+- 诊断 HTTP API 增加 Bearer Token 认证、请求体限制、响应上限和 URL 校验；Android 默认仅监听 `127.0.0.1`。
+- 新增 Android「局域网 API」显式开关；端口 8788 被占用时会显示实际回退端口。
+- 修复全屏模式没有可用退出入口、下载管理 `file://` 兼容、快捷方式 URL 启动、屏幕方向/网页调试设置重启失效。
+- WebView 禁止网页直接访问本地 file/content URI，并启用 Safe Browsing（系统支持时）。
+- 源码 ZIP 打包支持相对 CSS/JS URL，并限制单个资源大小，避免异常资源耗尽内存。
+- MCP 去除固定 Chromium revision/path，支持 Playwright 默认安装、系统 Chrome/Chromium 和 `BROWSERDIAG_CHROME`。
+- 修复 `browser_resize` 调错 Playwright 对象，并补齐 `browser_source`。
+- Node HTTP 默认只监听本机、强制 Token、限制请求体；新增 6 个回归测试。
+- GitHub Actions 同时检查 Node 与 Android：Node 测试/依赖审计，Android lint/单元测试任务/debug+release 构建。
+
+## Node MCP 能力（28 个工具）
 
 | 类别 | 工具 |
 |---|---|
 | 浏览器控制 | `browser_open` `browser_state` `browser_close` `browser_nav` `browser_resize` |
-| 交互操作 | `browser_click` `browser_click_at` `browser_type` `browser_keyboard` `browser_wheel` |
-| 信息采集 | `browser_console` `browser_network` `browser_dom` `browser_links` `browser_screenshot` `browser_save` |
-| 代码执行 | `browser_eval` `browser_run`（脚本化多步流程） |
-| 高级诊断 | `browser_perf`（TTFB/加载时序/慢资源） `browser_assert`（断言检查） `browser_report`（一键诊断报告） `browser_route`（请求拦截 mock） `browser_source`（页面源码） |
-| Flutter 辅助 | `browser_flutter`（语义树启用/节点查询/按 label 点击） |
+| 交互 | `browser_click` `browser_click_at` `browser_type` `browser_keyboard` `browser_wheel` `browser_wait` |
+| 采集 | `browser_console` `browser_network` `browser_dom` `browser_links` `browser_screenshot` `browser_save` `browser_source` |
+| 诊断 | `browser_perf` `browser_assert` `browser_report` `browser_run` `browser_route` |
+| Flutter | `browser_flutter` |
+| v3.1+ | `browser_text` `browser_interactive` `browser_http` |
 
-## 独立 APK 浏览器功能（v3.1 — Chrome 设计语言 + 矢量图标 + X 浏览器增强）
+## Android 浏览器
 
-| 功能 | 说明 |
+APK 提供多标签页、书签、历史、保存页面、分享、页面查找、翻译、二维码、TTS、媒体嗅探、资源查看、源码 ZIP、网络日志、下载管理、广告拦截、字体缩放、屏幕方向、UA/搜索引擎切换、用户脚本、深色主题、全屏、WebView 调试和可定制菜单。
+
+内嵌诊断 API 共 17 个：
+
+| API | 作用 |
 |---|---|
-| **Chrome 风格 UI** | 浅色 Material 配色（#F0F0F0/#202020/#1A73E8），胶囊地址栏，全矢量图标（34 个 Material VectorDrawable，无 emoji） |
-| **多标签页** | 最多 5 个标签，独立前进/后退栈，标签管理对话框 |
-| **底部导航栏** | 主页 / 后退 / 前进 / 刷新 / 标签 / 菜单（全矢量图标） |
-| **分组功能菜单** | 📌页面 / 🌐工具 / ⚙️设置 三组 26 项，图标+文字 |
-| **全屏模式** | 沉浸式浏览（隐藏顶栏/状态栏/底栏） |
-| **网络日志面板** | 实时展示 XHR/fetch 请求列表（方法/状态码/URL），点击复制 |
-| **下载管理** | 列出系统下载记录，点击直接打开文件 |
-| **广告拦截** | 26 个广告域名黑名单请求级屏蔽，一键开关 |
-| **允许调试网页** | WebView 远程调试开关（chrome://inspect 可连接） |
-| **字体大小** | 50%-200% textZoom 调节，持久化 |
-| **屏幕方向** | 自动 / 竖屏锁定 / 横屏锁定 |
-| **定制菜单** | 26 个菜单项显隐配置（持久化） |
-| **书签** | 收藏当前页 / 管理（最多 100 条，持久化） |
-| **保存页面** | outerHTML → 「下载」目录 .html |
-| **分享页面** | 系统分享（文字+链接） |
-| **页面查找** | 查找栏 + findAllAsync + 上一个/下一个 |
-| **翻译本页** | Google 翻译中转 |
-| **添加到桌面** | 主屏快捷方式（ShortcutManager） |
-| **嗅探媒体** | JS 扫描 video/audio/扩展名 → 打开/下载/复制链接 |
-| **页面资源** | 列出页面 img/script/link 资源 → 打开/下载 |
-| **源码 zip** | HTML + meta + console/network 日志 + 静态资源 → zip |
-| **生成二维码** | ZXing 生成当前页二维码（512px），可复制链接 |
-| **语音播报** | TTS 朗读正文，再点停止 |
-| **开发者工具** | API 地址/工具列表/console 统计 |
-| **深色主题** | 一键切换并持久化，全局换肤 |
-| **搜索引擎切换** | Google / Bing / 百度 / 搜狗 / DuckDuckGo |
-| **UA 切换** | Android / 桌面 Chrome / iPhone Safari |
-| **油猴脚本** | document-start 注入 + URL 匹配规则 |
-| **历史记录** | 最近 50 条，一键清空 |
-| **诊断 API** | 内嵌 :8788 HTTP 服务器（17 个 API，含 mcp-chrome 增强） |
-
-### 诊断 API（v3.1，17 个，参考 mcp-chrome 工具集）
-
-| API | 说明 | 对应 mcp-chrome |
-|---|---|---|
-| `browser_state` / `browser_console` / `browser_network` | 页面状态 / console / 网络日志 | chrome_console / chrome_network_capture |
-| `browser_eval` | 执行任意 JS | chrome_inject_script |
-| `browser_open` / `browser_close` / `browser_screenshot` / `browser_perf` / `browser_report` / `browser_source` | 打开/关闭/截图/性能/报告/源码 | chrome_navigate / chrome_screenshot |
-| `browser_tabs` | 列出全部标签（id/title/url/激活） | get_windows_and_tabs |
-| `browser_text` | 提取页面正文文本 | chrome_get_web_content |
-| `browser_interactive` | 可点击元素列表（含 CSS 选择器） | chrome_get_interactive_elements |
-| `browser_history` | 历史搜索（keyword/limit） | chrome_history |
-| `browser_bookmarks` | 书签查询/添加/删除 | chrome_bookmark_search/add/delete |
-| `browser_http` | 自定义 HTTP GET（状态码/头/正文） | chrome_network_request |
-| `browser_netlog` | 网络请求完整日志 | chrome_network_capture |
+| `browser_open` / `browser_close` / `browser_state` | 页面打开、重置与状态 |
+| `browser_console` / `browser_network` / `browser_netlog` | Console 与网络诊断 |
+| `browser_eval` / `browser_source` / `browser_text` | JS、源码和正文 |
+| `browser_screenshot` | PNG 截图，返回 metadata + base64 |
+| `browser_perf` / `browser_report` | 性能与综合报告 |
+| `browser_tabs` / `browser_interactive` | 标签和可交互元素 |
+| `browser_history` / `browser_bookmarks` | 历史与书签 |
+| `browser_http` | 带响应大小限制的 HTTP GET |
 
 ## 快速开始
 
-### MCP 插件（Node）
+### Node MCP
 
 ```bash
 cd mcp-server
-npm install
-# stdio 模式（MCP 注册）
+npm ci
+npx playwright-core install chromium
+
+# MCP stdio
 node server.js
-# HTTP 常驻模式（供远程调用）
-node server.js --http --port 8788
-# CLI 模式
+
+# CLI
 node server.js --cli browser_state
 ```
 
-### 独立 APK（Android）
+BrowserDiag 会依次尝试 `BROWSERDIAG_CHROME` / `CHROME_PATH`、系统 Chrome/Chromium、Playwright 缓存以及 Playwright 默认可执行文件。
 
-- 源码位于 `android/`，构建：
-  ```bash
-  cd android && ./gradlew assembleRelease
-  ```
-- 安装后启动 App，状态栏显示 API 地址 `http://<手机IP>:8788`
-- 同一局域网内 AI 工具可直接调用：`http://<手机IP>:8788/api/browser_open` 等
+### Node HTTP
 
-## HTTP API（APK / Node 通用）
+HTTP 模式默认监听 `127.0.0.1:8788`，必须设置或使用启动时自动生成的 Token：
 
-| 端点 | 说明 |
-|---|---|
-| `POST /api/browser_open` | 打开 URL（`{"url":"https://..."}`） |
-| `GET /api/browser_state` | 当前页面状态（URL/标题/加载状态） |
-| `GET /api/browser_console` | console 日志（含错误） |
-| `GET /api/browser_network` | 网络请求记录（XHR/fetch） |
-| `POST /api/browser_eval` | 执行 JS（`{"script":"..."}`） |
-| `GET /api/browser_screenshot` | 截图（base64） |
-| `GET /api/browser_perf` | 性能指标 |
-| `GET /api/browser_report` | 一键诊断报告 |
-| `GET /api/browser_close` | 关闭/重置 |
+```bash
+export BROWSERDIAG_TOKEN='replace-with-a-random-token-at-least-16-chars'
+node server.js --http 8788
 
-## 典型用法（配合 AI 排错）
+curl -s http://127.0.0.1:8788/api/browser_state \
+  -H "Authorization: Bearer $BROWSERDIAG_TOKEN"
+```
 
-1. `browser_open` 打开目标 Web 应用
-2. `browser_console` + `browser_network` 采集错误与失败请求
-3. `browser_eval` 注入代码验证修复
-4. `browser_report` 一键生成诊断结论
+如确实需要局域网访问，显式指定 `--host 0.0.0.0`。浏览器跨域客户端还需显式设置 `BROWSERDIAG_CORS_ORIGIN`；默认不开放 CORS。
 
-## CI
+### Android APK
 
-`.github/workflows/build-apk.yml`：每次 push 自动构建 APK 并上传 artifact。
+```bash
+cd android
+./gradlew assembleRelease
+```
+
+首次启动时 API 仅绑定本机。打开「菜单 → 开发者工具」可复制实际 API 地址和 API Token。需要电脑通过同一局域网访问时，再打开「菜单 → 局域网 API」。
+
+请求示例：
+
+```bash
+curl -s -X POST http://PHONE_IP:8788/api/browser_open \
+  -H "Authorization: Bearer YOUR_ANDROID_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://example.com/"}'
+```
+
+## 安全说明
+
+- HTTP API 含任意 JS、页面源码和自定义 HTTP 请求等高权限诊断能力，因此 v3.2 起强制 Token 认证。
+- Android 默认关闭局域网监听，并关闭应用数据备份，避免历史、书签、用户脚本与 API Token 被系统备份。
+- 不要把 `BROWSERDIAG_TOKEN` 写入仓库；`.env` 已加入忽略规则。
+- WebView 远程调试默认关闭，只在用户显式开启时生效。
+
+## 质量检查
+
+```bash
+cd mcp-server
+npm run check
+npm audit --omit=dev --audit-level=high
+```
+
+GitHub Actions 会在相关 push/PR 上运行 Node 检查，以及：
+
+```bash
+cd android
+./gradlew lintDebug testDebugUnitTest assembleDebug assembleRelease --no-daemon
+```
 
 ## 许可
 
-MIT
+[MIT](LICENSE)
