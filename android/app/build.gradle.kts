@@ -11,8 +11,8 @@ android {
         applicationId = "com.browserdiag.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 4
-        versionName = "3.1.0"
+        versionCode = 5
+        versionName = "3.2.0"
     }
 
     buildTypes {
@@ -26,6 +26,10 @@ android {
     }
     kotlinOptions {
         jvmTarget = "17"
+    }
+    lint {
+        abortOnError = true
+        checkReleaseBuilds = true
     }
 }
 
