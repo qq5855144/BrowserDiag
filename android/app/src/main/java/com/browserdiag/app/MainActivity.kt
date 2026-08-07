@@ -91,8 +91,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var pageActionButton: ImageButton
     private lateinit var tabCountButton: TextView
     private lateinit var pageProgress: ProgressBar
-    private lateinit var backButton: ImageButton
-    private lateinit var forwardButton: ImageButton
+    private lateinit var backButton: LinearLayout
+    private lateinit var forwardButton: LinearLayout
+    private lateinit var tabsNavButton: LinearLayout
     private val consoleLogs = mutableListOf<JSONObject>()
     private var server: DiagServer? = null
     private var serverPort = 8788
@@ -249,7 +250,7 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { showTabsDialog() }
         }
         topBar.addView(tabCountButton)
-        topBar.addView(iconBtn(R.drawable.ic_menu, 24, "更多") { showMainMenu() })
+        topBar.addView(iconBtn(R.drawable.ic_menu, 24, "工具中心") { showMainMenu() })
         root.addView(topBar)
 
         pageProgress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
@@ -302,17 +303,22 @@ class MainActivity : AppCompatActivity() {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(14.dp(), 0, 14.dp(), 0)
             setSingleLine(true)
+            isClickable = true
+            isFocusable = true
+            contentDescription = "诊断状态，点击打开开发者工具"
+            setOnClickListener { devTools() }
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 28.dp())
         }
         root.addView(statusBar)
 
-        // ---- 底部快捷导航：5 个高频动作，避免旧版 6 图标拥挤 ----
+        // ---- 底部主导航：浏览历史 / 主页 / 标签 / 全局工具始终一触可达 ----
         bottomBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            setPadding(4.dp(), 4.dp(), 4.dp(), 4.dp())
+            setPadding(4.dp(), 5.dp(), 4.dp(), 5.dp())
+            elevation = 8.dp().toFloat()
             layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 60.dp()
+                ViewGroup.LayoutParams.MATCH_PARENT, 68.dp()
             )
         }
         backButton = navBtn(R.drawable.ic_back, "后退") {
@@ -324,8 +330,9 @@ class MainActivity : AppCompatActivity() {
         bottomBar.addView(backButton)
         bottomBar.addView(forwardButton)
         bottomBar.addView(navBtn(R.drawable.ic_home, "主页") { goHome() })
-        bottomBar.addView(navBtn(R.drawable.ic_new_tab, "新建标签") { newTab(settings.engine.homeUrl) })
-        bottomBar.addView(navBtn(R.drawable.ic_share, "分享当前页") { sharePage() })
+        tabsNavButton = navBtn(R.drawable.ic_tab, "标签") { showTabsDialog() }
+        bottomBar.addView(tabsNavButton)
+        bottomBar.addView(navBtn(R.drawable.ic_tools, "工具", emphasized = true) { showMainMenu() })
         root.addView(bottomBar)
 
         setContentView(root)
@@ -355,20 +362,64 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun navBtn(drawableRes: Int, description: String, action: () -> Unit): ImageButton =
-        ImageButton(this).apply {
-            setImageResource(drawableRes)
-            val ripple = android.util.TypedValue()
-            if (theme.resolveAttribute(android.R.attr.selectableItemBackgroundBorderless, ripple, true)) {
-                setBackgroundResource(ripple.resourceId)
-            } else {
-                setBackgroundColor(Color.TRANSPARENT)
-            }
-            scaleType = ImageView.ScaleType.CENTER_INSIDE
-            contentDescription = description
-            layoutParams = LinearLayout.LayoutParams(0, 52.dp(), 1f)
-            setOnClickListener { action() }
+    private fun navBtn(
+        drawableRes: Int,
+        label: String,
+        emphasized: Boolean = false,
+        action: () -> Unit
+    ): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        gravity = Gravity.CENTER
+        contentDescription = label
+        isClickable = true
+        isFocusable = true
+        tag = if (emphasized) "nav-emphasized" else "nav-normal"
+        layoutParams = LinearLayout.LayoutParams(0, 58.dp(), 1f).apply {
+            marginStart = 2.dp()
+            marginEnd = 2.dp()
         }
+        setPadding(2.dp(), 4.dp(), 2.dp(), 3.dp())
+        val ripple = android.util.TypedValue()
+        if (theme.resolveAttribute(android.R.attr.selectableItemBackgroundBorderless, ripple, true)) {
+            setBackgroundResource(ripple.resourceId)
+        } else {
+            setBackgroundColor(Color.TRANSPARENT)
+        }
+        setOnClickListener { action() }
+        addView(ImageView(this@MainActivity).apply {
+            setImageResource(drawableRes)
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+            layoutParams = LinearLayout.LayoutParams(24.dp(), 24.dp()).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+            }
+        })
+        addView(TextView(this@MainActivity).apply {
+            text = label
+            textSize = 10.5f
+            gravity = Gravity.CENTER
+            setSingleLine(true)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = 2.dp() }
+        })
+        styleNavItem(this, emphasized)
+    }
+
+    private fun styleNavItem(item: LinearLayout, emphasized: Boolean = item.tag == "nav-emphasized") {
+        val color = if (emphasized) accentColor() else textColor()
+        for (i in 0 until item.childCount) {
+            when (val child = item.getChildAt(i)) {
+                is ImageView -> child.setColorFilter(color)
+                is TextView -> {
+                    child.setTextColor(color)
+                    child.setTypeface(
+                        null,
+                        if (emphasized) android.graphics.Typeface.BOLD else android.graphics.Typeface.NORMAL
+                    )
+                }
+            }
+        }
+    }
 
     private fun Int.dp(): Int = (this * resources.displayMetrics.density).toInt()
 
@@ -419,6 +470,7 @@ class MainActivity : AppCompatActivity() {
         barChildren.forEach { v ->
             if (v is ImageButton) v.setColorFilter(tint)
         }
+        bottomBar.children().filterIsInstance<LinearLayout>().forEach { styleNavItem(it) }
         siteInfoButton.setColorFilter(secondaryTextColor())
         pageActionButton.setColorFilter(secondaryTextColor())
         updateChromeControls()
@@ -431,8 +483,8 @@ class MainActivity : AppCompatActivity() {
     private fun buildStatusText(): String {
         val errs = synchronized(consoleLogs) { consoleLogs.filter { it.optString("type") == "error" }.size }
         val scope = if (settings.lanApiEnabled) "局域网" else "本机"
-        val api = if (server == null) "API 未启动" else "API $scope · ${serverPort}"
-        return "$api  ·  ${settings.engine.label}  ·  ${settings.uaMode.label}  ·  ${tabs.size} 标签  ·  Console ${consoleLogs.size} / $errs 错误"
+        val api = if (server == null) "API 未启动" else "API $scope:${serverPort}"
+        return "$api  ·  Console ${consoleLogs.size}/$errs  ·  点击诊断"
     }
 
     private fun reloadOrStop() {
@@ -461,6 +513,7 @@ class MainActivity : AppCompatActivity() {
         }
         val loading = wv != null && !isFullscreen && currentProgress in 1..99
         tabCountButton.text = tabs.size.toString()
+        tabsNavButton.contentDescription = "标签页，共 ${tabs.size} 个"
         backButton.isEnabled = wv?.canGoBack() == true
         forwardButton.isEnabled = wv?.canGoForward() == true
         backButton.alpha = if (backButton.isEnabled) 1f else 0.35f
@@ -973,31 +1026,50 @@ class MainActivity : AppCompatActivity() {
         setOmniboxUrl(settings.engine.homeUrl)
     }
 
-    // ==================== 主菜单：Chrome 快捷动作 + BrowserDiag 分组工具 ====================
-    private fun showMainMenu() {
-        val menuCfg = settings.getMenuConfig()
-        fun enabled(id: String) = id == "menuconfig" || id == "about" || menuCfg[id] != false
-        val groups = listOf(
-            Pair("页面与内容", listOf(
+    // ==================== 工具中心：稳定入口 + 快捷动作 + 永久可达的分类功能 ====================
+    private fun toolCategories(): List<ToolCategory> = listOf(
+        ToolCategory(
+            "页面与内容",
+            R.drawable.ic_widget,
+            "查找、保存、分享、翻译与页面操作",
+            listOf(
+                MenuItem("find", R.drawable.ic_find, "页面查找", "在当前网页中查找文字") { showFindBar() },
+                MenuItem("save", R.drawable.ic_save, "保存页面", "将当前页面保存到设备") { savePage() },
+                MenuItem("share", R.drawable.ic_share, "分享页面", "通过系统分享当前地址") { sharePage() },
                 MenuItem("translate", R.drawable.ic_translate, "翻译本页", "使用翻译服务打开当前页面") { translatePage() },
                 MenuItem("widget", R.drawable.ic_widget, "添加到桌面", "创建当前网站快捷方式") { addToHome() },
-                MenuItem("fullscreen", R.drawable.ic_launch, "全屏模式", "隐藏浏览器工具栏，专注页面内容") { toggleFullscreen() }
-            )),
-            Pair("浏览数据", listOf(
+                MenuItem("fullscreen", R.drawable.ic_launch, "全屏模式", "隐藏浏览器工具栏，专注页面内容") { toggleFullscreen() },
+                MenuItem("qr", R.drawable.ic_qr, "页面二维码", "将当前地址生成二维码") { showQr() },
+                MenuItem("tts", R.drawable.ic_mic, "语音播报", "朗读页面主要文本内容") { speakPage() }
+            )
+        ),
+        ToolCategory(
+            "浏览数据",
+            R.drawable.ic_history,
+            "${settings.getBookmarks().size} 书签 · ${settings.getHistory().size} 历史记录",
+            listOf(
                 MenuItem("bookmark", R.drawable.ic_bookmark, "书签", "收藏和管理常用页面") { showBookmarks() },
                 MenuItem("history", R.drawable.ic_history, "历史记录", "${settings.getHistory().size} 条最近访问记录") { showHistory() },
                 MenuItem("downloads", R.drawable.ic_download, "下载内容", "查看系统下载队列与已下载文件") { showDownloads() }
-            )),
-            Pair("诊断工具", listOf(
+            )
+        ),
+        ToolCategory(
+            "诊断与开发",
+            R.drawable.ic_tools,
+            "媒体、资源、源码、网络与 Console",
+            listOf(
                 MenuItem("sniff", R.drawable.ic_movie, "媒体嗅探", "识别 video / audio 与常见流媒体链接") { sniffMedia() },
                 MenuItem("resources", R.drawable.ic_folder, "页面资源", "查看图片、脚本和样式资源") { pageResources() },
                 MenuItem("source", R.drawable.ic_code, "源码归档", "导出 HTML、资源、Console 与网络日志") { downloadSourceZip() },
                 MenuItem("netlog", R.drawable.ic_network, "网络日志", "查看当前页面最近的请求状态") { showNetLog() },
-                MenuItem("devtools", R.drawable.ic_tools, "开发者工具", "诊断 API、Console 与页面状态") { devTools() },
-                MenuItem("qr", R.drawable.ic_qr, "页面二维码", "将当前地址生成二维码") { showQr() },
-                MenuItem("tts", R.drawable.ic_mic, "语音播报", "朗读页面主要文本内容") { speakPage() }
-            )),
-            Pair("浏览设置", listOf(
+                MenuItem("devtools", R.drawable.ic_tools, "开发者工具", "诊断 API、Console 与页面状态") { devTools() }
+            )
+        ),
+        ToolCategory(
+            "浏览设置",
+            R.drawable.ic_settings,
+            "${settings.engine.label} · ${settings.uaMode.label}",
+            listOf(
                 MenuItem("dark", R.drawable.ic_dark, "深色主题", if (isDark) "已开启" else "已关闭") { toggleDark() },
                 MenuItem("engine", R.drawable.ic_search, "搜索引擎", settings.engine.label) { showEnginePicker() },
                 MenuItem("ua", R.drawable.ic_phone, "User-Agent", settings.uaMode.label) { showUaPicker() },
@@ -1006,39 +1078,81 @@ class MainActivity : AppCompatActivity() {
                 MenuItem("orientation", R.drawable.ic_rotate, "屏幕方向", orientationLabel()) { showOrientation() },
                 MenuItem("adblock", R.drawable.ic_shield, "广告拦截", if (settings.adBlock) "已开启" else "已关闭") { toggleAdBlock() },
                 MenuItem("debugweb", R.drawable.ic_code, "WebView 调试", if (settings.debugWeb) "已开启" else "已关闭") { toggleDebugWeb() }
-            )),
-            Pair("BrowserDiag", listOf(
+            )
+        ),
+        ToolCategory(
+            "BrowserDiag",
+            R.drawable.ic_info,
+            if (settings.lanApiEnabled) "诊断 API 已允许局域网访问" else "诊断 API 仅限本机",
+            listOf(
                 MenuItem("lanapi", R.drawable.ic_link, "局域网诊断 API", if (settings.lanApiEnabled) "已开启 · Token 认证" else "已关闭 · 仅本机") { toggleLanApi() },
-                MenuItem("menuconfig", R.drawable.ic_settings, "定制功能菜单", "选择菜单中显示的功能") { showMenuConfig() },
+                MenuItem("menuconfig", R.drawable.ic_settings, "常用工具设置", "选择工具中心的常用快捷入口") { showMenuConfig() },
                 MenuItem("about", R.drawable.ic_info, "关于 BrowserDiag", "v3.2.0 · API ${serverPort}") { showAbout() }
-            ))
+            )
         )
-        val filtered = groups.map { (title, items) -> title to items.filter { enabled(it.id) } }
-            .filter { it.second.isNotEmpty() }
+    )
 
-        val currentTitle = tabs.current?.title.orEmpty().ifEmpty { displayHost(currentWeb()?.url.orEmpty()) }
-        val dialog = showBrowserSheet("BrowserDiag", currentTitle.take(72)) { content, sheet ->
-            val quick = LinearLayout(this).apply {
+    private fun addToolShortcutGrid(
+        content: LinearLayout,
+        items: List<MenuItem>,
+        sheet: BottomSheetDialog
+    ) {
+        items.chunked(4).forEach { chunk ->
+            val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
-                setPadding(1.dp(), 2.dp(), 1.dp(), 6.dp())
+                setPadding(1.dp(), 2.dp(), 1.dp(), 4.dp())
             }
-            if (enabled("bookmark")) quick.addView(quickAction(R.drawable.ic_bookmark, "收藏") {
-                sheet.dismiss(); addCurrentToBookmarks()
-            })
-            if (enabled("find")) quick.addView(quickAction(R.drawable.ic_find, "查找") {
-                sheet.dismiss(); showFindBar()
-            })
-            if (enabled("share")) quick.addView(quickAction(R.drawable.ic_share, "分享") {
-                sheet.dismiss(); sharePage()
-            })
-            if (enabled("save")) quick.addView(quickAction(R.drawable.ic_save, "保存") {
-                sheet.dismiss(); savePage()
-            })
-            if (quick.childCount > 0) content.addView(quick)
+            chunk.forEach { item ->
+                row.addView(quickAction(item.icon, item.label) {
+                    sheet.dismiss()
+                    item.action()
+                })
+            }
+            repeat(4 - chunk.size) {
+                row.addView(View(this).apply {
+                    layoutParams = LinearLayout.LayoutParams(0, 1.dp(), 1f).apply {
+                        marginStart = 3.dp()
+                        marginEnd = 3.dp()
+                    }
+                })
+            }
+            content.addView(row)
+        }
+    }
 
-            filtered.forEach { (groupTitle, items) ->
-                content.addView(sectionTitle(groupTitle))
-                items.forEach { item ->
+    private fun showToolGroup(category: ToolCategory) {
+        showBrowserSheet(
+            title = category.title,
+            subtitle = category.subtitle,
+            headerActionLabel = "工具中心",
+            headerAction = { dialog ->
+                dialog.dismiss()
+                showMainMenu()
+            }
+        ) { content, sheet ->
+            category.items.forEach { item ->
+                content.addView(panelRow(item.icon, item.label, item.subtitle, onClick = {
+                    sheet.dismiss()
+                    item.action()
+                }))
+            }
+        }
+    }
+
+    private fun showAllTools() {
+        val categories = toolCategories()
+        showBrowserSheet(
+            title = "全部工具",
+            subtitle = "${categories.sumOf { it.items.size }} 个功能 · 不受快捷设置影响",
+            headerActionLabel = "工具中心",
+            headerAction = { dialog ->
+                dialog.dismiss()
+                showMainMenu()
+            }
+        ) { content, sheet ->
+            categories.forEach { category ->
+                content.addView(sectionTitle(category.title))
+                category.items.forEach { item ->
                     content.addView(panelRow(item.icon, item.label, item.subtitle, onClick = {
                         sheet.dismiss()
                         item.action()
@@ -1046,11 +1160,102 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+    }
+
+    private fun showMainMenu() {
+        mainMenuDialog?.dismiss()
+        val categories = toolCategories()
+        val allItems = categories.flatMap { it.items }
+        val cfg = settings.getMenuConfig()
+        val fixedPageActions = setOf("find", "save", "share")
+        val defaultFavorites = listOf("history", "downloads", "netlog", "devtools", "engine", "userscript", "dark", "ua")
+        val favoriteIds = if (cfg.isEmpty()) {
+            defaultFavorites
+        } else {
+            allItems.filter { cfg[it.id] == true && it.id !in fixedPageActions }.map { it.id }.take(8)
+        }
+        val favorites = favoriteIds.mapNotNull { id -> allItems.firstOrNull { it.id == id } }
+        val currentTitle = tabs.current?.title.orEmpty().ifEmpty { displayHost(currentWeb()?.url.orEmpty()) }
+
+        val dialog = showBrowserSheet("工具中心", currentTitle.take(72)) { content, sheet ->
+            content.addView(sectionTitle("当前页面"))
+            val pageQuick = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(1.dp(), 2.dp(), 1.dp(), 6.dp())
+            }
+            pageQuick.addView(quickAction(R.drawable.ic_bookmark, "收藏当前") {
+                sheet.dismiss(); addCurrentToBookmarks()
+            })
+            pageQuick.addView(quickAction(R.drawable.ic_find, "查找") {
+                sheet.dismiss(); showFindBar()
+            })
+            pageQuick.addView(quickAction(R.drawable.ic_share, "分享") {
+                sheet.dismiss(); sharePage()
+            })
+            pageQuick.addView(quickAction(R.drawable.ic_save, "保存") {
+                sheet.dismiss(); savePage()
+            })
+            content.addView(pageQuick)
+
+            content.addView(sectionTitle("常用工具"))
+            if (favorites.isEmpty()) {
+                content.addView(panelRow(
+                    R.drawable.ic_settings,
+                    "尚未配置常用工具",
+                    "点击选择最多 8 个快捷入口",
+                    onClick = {
+                        sheet.dismiss()
+                        showMenuConfig()
+                    }
+                ))
+            } else {
+                addToolShortcutGrid(content, favorites, sheet)
+            }
+
+            content.addView(sectionTitle("全部功能分类"))
+            categories.forEach { category ->
+                content.addView(panelRow(
+                    category.icon,
+                    category.title,
+                    "${category.items.size} 个功能 · ${category.subtitle}",
+                    trailingIcon = R.drawable.ic_forward,
+                    onTrailing = {
+                        sheet.dismiss()
+                        showToolGroup(category)
+                    },
+                    onClick = {
+                        sheet.dismiss()
+                        showToolGroup(category)
+                    }
+                ))
+            }
+            content.addView(panelRow(
+                R.drawable.ic_tools,
+                "全部工具一览",
+                "一次查看所有功能；任何功能都不会因快捷设置而消失",
+                trailingIcon = R.drawable.ic_forward,
+                onTrailing = {
+                    sheet.dismiss()
+                    showAllTools()
+                },
+                onClick = {
+                    sheet.dismiss()
+                    showAllTools()
+                }
+            ))
+        }
         mainMenuDialog = dialog
         dialog.setOnDismissListener {
             if (mainMenuDialog === dialog) mainMenuDialog = null
         }
     }
+
+    private class ToolCategory(
+        val title: String,
+        val icon: Int,
+        val subtitle: String,
+        val items: List<MenuItem>
+    )
 
     private class MenuItem(
         val id: String,
@@ -1931,41 +2136,70 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 定制菜单：菜单项显隐开关（持久化） */
+    /** 常用工具：只控制工具中心快捷入口，分类中的完整功能永远保留。 */
     private fun showMenuConfig() {
-        val allItems = listOf(
-            "bookmark" to "书签", "save" to "保存页面", "share" to "分享", "find" to "页面查找",
-            "translate" to "翻译本页", "widget" to "添加到桌面", "fullscreen" to "全屏模式",
-            "sniff" to "嗅探媒体资源", "resources" to "查看页面资源", "source" to "页面源码zip",
-            "qr" to "生成二维码", "tts" to "语音播报", "netlog" to "网络日志", "downloads" to "下载管理",
-            "devtools" to "开发者工具", "dark" to "深色主题", "engine" to "搜索引擎",
-            "ua" to "UA 切换", "userscript" to "油猴脚本", "font" to "字体大小",
-            "orientation" to "屏幕方向", "adblock" to "广告拦截", "debugweb" to "允许调试网页",
-            "lanapi" to "局域网 API", "history" to "历史记录"
-        )
-        val cfg = settings.getMenuConfig().toMutableMap()
+        val categories = toolCategories()
+        val allItems = categories.flatMap { it.items }
+        val fixedPageActions = setOf("find", "save", "share")
+        val configurable = allItems.filter {
+            it.id != "menuconfig" && it.id != "about" && it.id !in fixedPageActions
+        }
+        val defaults = listOf("history", "downloads", "netlog", "devtools", "engine", "userscript", "dark", "ua")
+        val stored = settings.getMenuConfig()
+        val selected = linkedSetOf<String>().apply {
+            if (stored.isEmpty()) {
+                addAll(defaults)
+            } else {
+                addAll(configurable.filter { stored[it.id] == true }.map { it.id }.take(8))
+            }
+        }
         showBrowserSheet(
-            title = "定制功能菜单",
-            subtitle = "关于与本项始终显示",
+            title = "常用工具",
+            subtitle = "最多 8 个快捷入口；所有功能始终保留在分类中",
             headerActionLabel = "保存",
             headerAction = { dialog ->
-                settings.setMenuConfig(cfg)
-                toast("功能菜单已更新")
+                settings.setMenuConfig(allItems.associate { it.id to (it.id in selected) })
+                toast("常用工具已更新")
                 dialog.dismiss()
             }
         ) { content, _ ->
-            allItems.forEach { (id, label) ->
-                content.addView(MaterialSwitch(this).apply {
-                    text = label
-                    textSize = 14.5f
-                    setTextColor(textColor())
-                    isChecked = cfg[id] != false
-                    setPadding(14.dp(), 7.dp(), 14.dp(), 7.dp())
-                    layoutParams = LinearLayout.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-                    )
-                    setOnCheckedChangeListener { _, isChecked -> cfg[id] = isChecked }
-                })
+            val counter = TextView(this).apply {
+                text = "已选择 ${selected.size}/8"
+                textSize = 13f
+                setTextColor(accentColor())
+                setTypeface(null, android.graphics.Typeface.BOLD)
+                setPadding(14.dp(), 6.dp(), 14.dp(), 4.dp())
+            }
+            content.addView(counter)
+            categories.forEach { category ->
+                val categoryItems = category.items.filter { it in configurable }
+                if (categoryItems.isEmpty()) return@forEach
+                content.addView(sectionTitle(category.title))
+                categoryItems.forEach { item ->
+                    content.addView(MaterialSwitch(this).apply {
+                        text = item.label
+                        textSize = 14.5f
+                        setTextColor(textColor())
+                        isChecked = item.id in selected
+                        setPadding(14.dp(), 7.dp(), 14.dp(), 7.dp())
+                        layoutParams = LinearLayout.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                        )
+                        setOnCheckedChangeListener { button, checked ->
+                            if (checked) {
+                                if (selected.size >= 8 && item.id !in selected) {
+                                    button.isChecked = false
+                                    toast("常用工具最多选择 8 个")
+                                } else {
+                                    selected.add(item.id)
+                                }
+                            } else {
+                                selected.remove(item.id)
+                            }
+                            counter.text = "已选择 ${selected.size}/8"
+                        }
+                    })
+                }
             }
         }
     }

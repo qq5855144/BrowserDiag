@@ -232,7 +232,7 @@ class Settings(private val ctx: Context) {
             return token
         }
 
-    // ---------- 定制菜单（菜单项显隐） ----------
+    // ---------- 工具中心常用入口（完整功能分类不受此配置影响） ----------
     fun getMenuConfig(): Map<String, Boolean> {
         val raw = prefs.getString("menu_config", null) ?: return emptyMap()
         return try {
