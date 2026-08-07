@@ -46,7 +46,12 @@ class Tabs(private val context: Context, private val maxTabs: Int = 5) {
     fun switchTo(id: Int): Tab? {
         val idx = tabs.indexOfFirst { it.id == id }
         if (idx < 0) return null
-        tabs[currentIndex]?.let { if (it.visible) { it.webView.visibility = android.view.View.GONE; it.visible = false } }
+        current?.let {
+            if (it.visible) {
+                it.webView.visibility = android.view.View.GONE
+                it.visible = false
+            }
+        }
         currentIndex = idx
         val t = tabs[idx]
         t.webView.visibility = android.view.View.VISIBLE
@@ -64,15 +69,22 @@ class Tabs(private val context: Context, private val maxTabs: Int = 5) {
         tab.webView.destroy()
         tabs.removeAt(idx)
         if (wasCurrent) {
-            currentIndex = if (tabs.isEmpty()) -1 else 0
-            if (currentIndex >= 0) switchTo(tabs[currentIndex].id)
+            currentIndex = -1
+            if (tabs.isNotEmpty()) {
+                switchTo(tabs[minOf(idx, tabs.lastIndex)].id)
+            }
         } else if (currentIndex > idx) {
             currentIndex--
         }
     }
 
     fun destroyAll() {
-        tabs.toList().forEach { destroy(it.id) }
+        tabs.forEach { tab ->
+            (tab.webView.parent as? ViewGroup)?.removeView(tab.webView)
+            tab.webView.destroy()
+        }
+        tabs.clear()
+        currentIndex = -1
     }
 
     fun get(id: Int): Tab? = tabs.firstOrNull { it.id == id }
