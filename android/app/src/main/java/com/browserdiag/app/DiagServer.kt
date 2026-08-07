@@ -44,6 +44,7 @@ class DiagServer(
                 "browser_screenshot" -> screenshot()
                 "browser_perf" -> perf()
                 "browser_report" -> report()
+                "browser_source" -> source()
                 "browser_close" -> JSONObject().put("closed", true)
                 else -> JSONObject().put("error", "unknown tool: $tool").put("available", tools())
             }
@@ -59,8 +60,19 @@ class DiagServer(
 
     private fun tools() = arrayOf(
         "browser_open", "browser_state", "browser_console", "browser_network",
-        "browser_eval", "browser_screenshot", "browser_perf", "browser_report", "browser_close"
+        "browser_eval", "browser_screenshot", "browser_perf", "browser_report",
+        "browser_source", "browser_close"
     )
+
+    /** 获取当前页面 HTML 源码（供 AI 分析与后续开发） */
+    private fun source(): JSONObject {
+        val html = evalJs("document.documentElement.outerHTML") ?: ""
+        val url = evalJs("location.href") ?: ""
+        return JSONObject()
+            .put("url", url.trim('"'))
+            .put("htmlLength", html.length)
+            .put("html", html)
+    }
 
     private fun parseParams(session: IHTTPSession): JSONObject {
         return try {
