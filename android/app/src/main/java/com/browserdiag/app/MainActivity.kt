@@ -115,6 +115,8 @@ class MainActivity : AppCompatActivity() {
     private var mainMenuDialog: Dialog? = null
     private var lastExitBackPressedAt = 0L
     private val networkScriptHandlers = WeakHashMap<WebView, MutableList<ScriptHandler>>()
+    /** 已注册用户脚本的 WebView -> 脚本 id 集合（避免重复注册导致脚本多次执行） */
+    private val registeredUserscripts = WeakHashMap<WebView, MutableSet<String>>()
 
     // Chrome / Material 3 风格调色板。手动主题与系统组件主题保持同步。
     private fun surfaceColor() = if (isDark) 0xFF202124.toInt() else 0xFFF8FAFD.toInt()
@@ -889,16 +891,7 @@ class MainActivity : AppCompatActivity() {
 
         // 网络实验室 Hook + 油猴脚本（document-start）
         installNetworkRuleHooks(wv)
-        settings.getScripts().filter { it.enabled }.forEach { s ->
-            try {
-                WebViewCompat.addDocumentStartJavaScript(
-                    wv,
-                    wrapUserscriptForRuntime(s),
-                    patternToOriginRules(s.urlPattern)
-                )
-            } catch (e: Exception) {
-            }
-        }
+        installUserscripts(wv)
 
         wv.webChromeClient = object : WebChromeClient() {
             override fun onProgressChanged(view: WebView?, newProgress: Int) {
@@ -957,6 +950,8 @@ class MainActivity : AppCompatActivity() {
             }
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                // 每次导航时补注册新增/启用的用户脚本（安装后刷新页面即可生效，幂等防重复）
+                if (view != null) installUserscripts(view)
                 val scriptUri = url?.let { runCatching { Uri.parse(it) }.getOrNull() }
                 if (scriptUri != null && isUserscriptUri(scriptUri)) {
                     view?.stopLoading()
@@ -2923,6 +2918,27 @@ class MainActivity : AppCompatActivity() {
     private fun scriptPatternList(value: String): List<String> =
         value.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.distinct().toList()
 
+    /** 幂等注册当前已启用的用户脚本；新安装/重新启用的脚本在下一次导航时自动补注册 */
+    private fun installUserscripts(wv: WebView) {
+        val registered = registeredUserscripts.getOrPut(wv) { mutableSetOf() }
+        settings.getScripts().filter { it.enabled }.forEach { s ->
+            if (registered.add(s.id)) {
+                val wrapped = wrapUserscriptForRuntime(s)
+                try {
+                    WebViewCompat.addDocumentStartJavaScript(
+                        wv,
+                        wrapped,
+                        patternToOriginRules(s.urlPattern)
+                    )
+                } catch (e: Exception) {
+                    // addDocumentStartJavaScript 需要较新的 WebView；不支持时跳过，由下方直接执行兜底
+                }
+                // 当前页面立即执行一次（wrapper 内含幂等保护 + DOMContentLoaded 兜底）
+                runCatching { wv.evaluateJavascript(wrapped, null) }
+            }
+        }
+    }
+
     /**
      * WebView document-start API 只能按 origin 限制，先尽量收窄域名；
      * 具体路径、@include 与 @exclude 再由运行时 wrapper 精确判断。
@@ -2965,10 +2981,29 @@ class MainActivity : AppCompatActivity() {
         val includes = JSONArray(scriptPatternList(script.urlPattern).ifEmpty { listOf("*") }).toString()
         val excludes = JSONArray(scriptPatternList(script.excludePattern)).toString()
         val label = JSONObject.quote(script.name)
+        val scriptId = JSONObject.quote(script.id)
         return buildString {
             append(
                 """
                 (function(){
+                  if (window['__bdUserscript_'+$scriptId]) return;
+                  window['__bdUserscript_'+$scriptId] = true;
+                  // ---- GM_* 兼容 shim（商店脚本常用） ----
+                  if (typeof GM_addStyle === 'undefined') {
+                    window.GM_addStyle = function(css){ var s=document.createElement('style'); s.textContent=css; (document.head||document.documentElement).appendChild(s); return s; };
+                  }
+                  if (typeof GM_getValue === 'undefined') {
+                    window.GM_getValue = function(k,d){ try{ var v=localStorage.getItem('__bd_gs_'+k); return v===null?d:JSON.parse(v); }catch(e){ return d; } };
+                  }
+                  if (typeof GM_setValue === 'undefined') {
+                    window.GM_setValue = function(k,v){ try{ localStorage.setItem('__bd_gs_'+k, JSON.stringify(v)); }catch(e){} };
+                  }
+                  if (typeof GM_deleteValue === 'undefined') {
+                    window.GM_deleteValue = function(k){ try{ localStorage.removeItem('__bd_gs_'+k); }catch(e){} };
+                  }
+                  if (typeof GM_log === 'undefined') {
+                    window.GM_log = function(){ try{ console.log.apply(console, arguments); }catch(e){} };
+                  }
                   var __bdIncludes = $includes;
                   var __bdExcludes = $excludes;
                   function __bdMatch(pattern, url) {
@@ -2991,7 +3026,8 @@ class MainActivity : AppCompatActivity() {
                   var __bdUrl = String(location.href);
                   if (!__bdIncludes.some(function(p){ return __bdMatch(p, __bdUrl); })) return;
                   if (__bdExcludes.some(function(p){ return __bdMatch(p, __bdUrl); })) return;
-                  try {
+                  function __bdRun() {
+                    try {
                 """.trimIndent()
             )
             append('\n')
@@ -2999,9 +3035,15 @@ class MainActivity : AppCompatActivity() {
             append('\n')
             append(
                 """
-                  } catch (e) {
-                    console.error('[BrowserDiag UserScript]', $label, e);
+                    } catch (e) {
+                      console.error('[BrowserDiag UserScript]', $label, e);
+                    }
                   }
+                  // document-start 阶段 document.body 可能尚未建立：等 DOMContentLoaded 兜底执行
+                  if (document.body) __bdRun();
+                  else if (document.readyState === 'loading') {
+                    document.addEventListener('DOMContentLoaded', function(){ __bdRun(); });
+                  } else __bdRun();
                 })();
                 """.trimIndent()
             )
