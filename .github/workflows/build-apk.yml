@@ -65,9 +65,9 @@ jobs:
       - name: Decode release signing keystore
         if: github.event_name != 'pull_request'
         run: |
-          mkdir -p ../keystore
-          echo "${{ secrets.BROWSERDIAG_KEYSTORE_B64 }}" | base64 -d > ../keystore/browserdiag-release.keystore
-          ls -la ../keystore/
+          mkdir -p keystore
+          echo "${{ secrets.BROWSERDIAG_KEYSTORE_B64 }}" | base64 -d > keystore/browserdiag-release.keystore
+          ls -la keystore/
 
       - name: Lint, test, and build APKs
         env:
@@ -79,8 +79,12 @@ jobs:
       - name: Verify release APK signature
         if: github.event_name != 'pull_request'
         run: |
+          ls -la app/build/outputs/apk/release/
           apksigner=$(ls "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | tail -1)
-          "$apksigner" verify --print-certs app/build/outputs/apk/release/*-release.apk
+          for apk in app/build/outputs/apk/release/*.apk; do
+            echo "Verifying $apk"
+            "$apksigner" verify --print-certs "$apk"
+          done
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
@@ -104,7 +108,7 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           VERSION=$(grep -oP 'versionName\s*=\s*"\K[^"]+' android/app/build.gradle.kts)
           TAG="v${VERSION}"
-          APK=$(ls android/app/build/outputs/apk/release/*-release.apk | head -1)
+          APK=$(ls android/app/build/outputs/apk/release/app-release.apk 2>/dev/null || ls android/app/build/outputs/apk/release/*.apk 2>/dev/null | grep -v unsigned | head -1)
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG already exists, uploading new artifact..."
             gh release upload "$TAG" "$APK" --clobber
