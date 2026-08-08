@@ -15,6 +15,7 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.InputStream
 import java.net.HttpURLConnection
+import java.net.URI
 import java.net.URL
 import java.security.MessageDigest
 import java.util.UUID
@@ -53,6 +54,7 @@ class DiagServer(
             if (mcpTransportRoute) addMcpHeaders(r, session) else addCorsHeaders(r)
             return r
         }
+        if (legacySseEndpoint && session.method == Method.POST) return serveLegacySseMessage(session)
         if (legacySseEndpoint || isLegacySseFallbackRequest(session)) return serveLegacySse(session)
         if (legacyMessageEndpoint) return serveLegacySseMessage(session)
         if (mcpEndpoint) return serveMcp(session)
@@ -90,6 +92,7 @@ class DiagServer(
     }
 
     private fun tools() = arrayOf(
+        "BrowserDiag",
         "browser_open", "browser_state", "browser_console", "browser_network",
         "browser_eval", "browser_screenshot", "browser_perf", "browser_report",
         "browser_source", "browser_tabs", "browser_text", "browser_interactive",
@@ -99,6 +102,7 @@ class DiagServer(
 
     private fun executeTool(tool: String, params: JSONObject): JSONObject = try {
         when (tool) {
+            "BrowserDiag" -> browserDiagFacade(params)
             "browser_state" -> state()
             "browser_console" -> console(params)
             "browser_network" -> network()
@@ -131,21 +135,22 @@ class DiagServer(
     }
 
     private fun isLegacySseEndpoint(uri: String): Boolean =
-        uri.substringBefore('?').trimEnd('/') == "/sse"
+        uri.substringBefore('?').trimEnd('/').let { it == "/sse" || it == "/mcp/sse" }
 
     private fun isLegacyMessageEndpoint(uri: String): Boolean {
         val path = uri.substringBefore('?').trimEnd('/')
-        return path == "/message" || path == "/messages"
+        return path == "/message" || path == "/messages" ||
+            path == "/mcp/message" || path == "/mcp/messages"
     }
 
     /**
-     * 旧 MCP 客户端通常只拿到一个 URL：GET + text/event-stream，且没有 MCP-Protocol-Version。
-     * 现代 Streamable HTTP 客户端会先 POST initialize；因此可在同一个根 URL 上无歧义回退 SSE。
+     * 旧 MCP 客户端通常只拿到一个 URL：GET，且没有 MCP-Protocol-Version。
+     * Streamable HTTP 客户端会以 POST 开场（2026 直接请求/发现，2025 initialize）；因此根 URL 的 GET 可无歧义回退 SSE。
+     * 一些移动客户端错误地发送 Accept: */*，这里也兼容；2026 客户端会携带版本 Header，不会误入 SSE。
      */
     private fun isLegacySseFallbackRequest(session: IHTTPSession): Boolean =
         isMcpEndpoint(session.uri) &&
             session.method == Method.GET &&
-            header(session, "Accept")?.contains("text/event-stream", ignoreCase = true) == true &&
             header(session, "MCP-Protocol-Version").isNullOrBlank()
 
     // ==================== MCP 2024-11-05 HTTP + SSE compatibility ====================
@@ -271,6 +276,19 @@ class DiagServer(
 
         return when (payload) {
             is JSONObject -> {
+                validateModernRequest(payload, session)?.let { error ->
+                    return mcpJsonResponse(session, Response.Status.BAD_REQUEST, error.toString())
+                }
+                val modern = isModernRequest(payload, session)
+                val method = payload.optString("method").trim()
+                if (modern && method.isNotEmpty() && method !in MODERN_MCP_METHODS) {
+                    McpDiagnostics.recordReject("2026 method not supported: $method")
+                    return mcpJsonResponse(
+                        session,
+                        Response.Status.NOT_FOUND,
+                        jsonRpcError(payload.opt("id") ?: JSONObject.NULL, -32601, "Method not found: $method").toString()
+                    )
+                }
                 val response = handleMcpMessage(payload, session)
                 if (response == null) mcpAcceptedResponse(session)
                 else mcpJsonResponse(session, Response.Status.OK, response.toString())
@@ -294,6 +312,73 @@ class DiagServer(
             }
             else -> mcpErrorResponse(session, Response.Status.BAD_REQUEST, -32600, "Invalid Request")
         }
+    }
+
+    /** 2026-07-28 是无状态协议：版本、客户端信息与能力都随每个请求放在 params._meta。 */
+    private fun requestMeta(message: JSONObject): JSONObject? =
+        message.optJSONObject("params")?.optJSONObject("_meta")
+
+    private fun modernBodyProtocol(message: JSONObject): String? =
+        requestMeta(message)?.optString(META_PROTOCOL_VERSION)?.trim()?.takeIf { it.isNotEmpty() }
+
+    private fun isModernRequest(message: JSONObject, session: IHTTPSession): Boolean {
+        val meta = requestMeta(message)
+        val bodyVersion = modernBodyProtocol(message)
+        val headerVersion = header(session, "MCP-Protocol-Version")?.trim().orEmpty()
+        return bodyVersion == MCP_CURRENT_VERSION || headerVersion == MCP_CURRENT_VERSION ||
+            meta?.has(META_CLIENT_CAPABILITIES) == true ||
+            (bodyVersion != null && bodyVersion !in LEGACY_MCP_VERSIONS) ||
+            (headerVersion.isNotEmpty() && headerVersion !in LEGACY_MCP_VERSIONS)
+    }
+
+    /**
+     * 对 modern 请求校验会影响路由安全的 Header/Body 一致性；缺少 2026 必需元数据时返回可识别错误。
+     * Mcp-Method/Mcp-Name 缺失暂时宽容，以兼容刚升级协议但尚未镜像 Header 的移动客户端。
+     */
+    private fun validateModernRequest(message: JSONObject, session: IHTTPSession): JSONObject? {
+        if (!isModernRequest(message, session)) return null
+        val id = message.opt("id") ?: JSONObject.NULL
+        val meta = requestMeta(message)
+        val bodyVersion = modernBodyProtocol(message)
+        val headerVersion = header(session, "MCP-Protocol-Version")?.trim().orEmpty()
+        if (meta == null || bodyVersion == null || !meta.has(META_CLIENT_CAPABILITIES)) {
+            McpDiagnostics.recordReject("2026 request missing params._meta protocolVersion/clientCapabilities")
+            return jsonRpcError(id, -32602, "2026 request requires protocolVersion and clientCapabilities in params._meta")
+        }
+        if (headerVersion.isEmpty()) {
+            // 为非完全合规的移动端保留互操作性；body 元数据仍提供确定的版本来源。
+        } else if (headerVersion != bodyVersion) {
+            McpDiagnostics.recordReject("MCP-Protocol-Version header/body mismatch")
+            return jsonRpcError(id, -32020, "Header mismatch: MCP-Protocol-Version does not match params._meta")
+        }
+        if (bodyVersion != MCP_CURRENT_VERSION) {
+            McpDiagnostics.recordReject("unsupported modern protocol: $bodyVersion")
+            return jsonRpcError(
+                id,
+                -32022,
+                "Unsupported protocol version",
+                JSONObject()
+                    .put("supported", JSONArray(MCP_SUPPORTED_VERSIONS))
+                    .put("requested", bodyVersion)
+            )
+        }
+        val bodyMethod = message.optString("method").trim()
+        header(session, "Mcp-Method")?.takeIf { it.isNotBlank() }?.let { routedMethod ->
+            if (routedMethod != bodyMethod) {
+                McpDiagnostics.recordReject("Mcp-Method header/body mismatch")
+                return jsonRpcError(id, -32020, "Header mismatch: Mcp-Method does not match request method")
+            }
+        }
+        if (bodyMethod == "tools/call") {
+            val bodyName = message.optJSONObject("params")?.optString("name").orEmpty()
+            header(session, "Mcp-Name")?.takeIf { it.isNotBlank() }?.let { routedName ->
+                if (routedName != bodyName) {
+                    McpDiagnostics.recordReject("Mcp-Name header/body mismatch")
+                    return jsonRpcError(id, -32020, "Header mismatch: Mcp-Name does not match params.name")
+                }
+            }
+        }
+        return null
     }
 
     private fun parseMcpPayload(session: IHTTPSession): Any {
@@ -333,12 +418,15 @@ class DiagServer(
         if (method.isEmpty()) return if (hasId) jsonRpcError(id, -32600, "Invalid Request: method required") else null
         val protocolVersion = protocolVersionOverride ?: run {
             if (method == "initialize") selectLegacyProtocol(message.optJSONObject("params"))
-            else header(session, "MCP-Protocol-Version")?.takeIf { it.isNotBlank() }
+            else modernBodyProtocol(message)
+                ?: header(session, "MCP-Protocol-Version")?.takeIf { it.isNotBlank() }
                 ?: MCP_HTTP_FALLBACK_VERSION
         }
         val clientName = if (method == "initialize") {
             message.optJSONObject("params")?.optJSONObject("clientInfo")?.optString("name").orEmpty()
-        } else ""
+        } else {
+            requestMeta(message)?.optJSONObject(META_CLIENT_INFO)?.optString("name").orEmpty()
+        }
         McpDiagnostics.recordMessage(method, protocolVersion, clientName)
 
         // 2026-07-28 把路由信息镜像到 Header；有 Header 时严格核对，缺失时为旧客户端保持兼容。
@@ -359,7 +447,9 @@ class DiagServer(
         val result = when (method) {
             "initialize" -> legacyInitializeResult(message.optJSONObject("params"))
             "server/discover" -> discoverResult()
-            "ping" -> JSONObject()
+            "ping" -> if (protocolVersion == MCP_CURRENT_VERSION) {
+                return jsonRpcError(id, -32601, "Method not found: ping")
+            } else JSONObject()
             "tools/list" -> listToolsResult(protocolVersion)
             "tools/call" -> {
                 val params = message.optJSONObject("params")
@@ -378,6 +468,7 @@ class DiagServer(
                         }
                         if (protocolVersion == MCP_CURRENT_VERSION) {
                             result.put("resultType", "complete")
+                            addModernServerMeta(result)
                         }
                     }
             }
@@ -421,16 +512,29 @@ class DiagServer(
         .put("ttlMs", 300_000)
         .put("cacheScope", "private")
 
-    private fun listToolsResult(protocolVersion: String): JSONObject = JSONObject()
-        .put("tools", mcpToolDefinitions(protocolVersion))
-        .also { result ->
+    private fun listToolsResult(protocolVersion: String): JSONObject {
+        val definitions = mcpToolDefinitions(protocolVersion)
+        McpDiagnostics.recordToolsReturned(definitions.length())
+        return JSONObject()
+            .put("tools", definitions)
+            .also { result ->
             // 2024/2025 客户端收到官方版本对应的最小 ListToolsResult，避免严格 schema 丢弃工具。
             if (protocolVersion == MCP_CURRENT_VERSION) {
                 result.put("resultType", "complete")
                 result.put("ttlMs", 300_000)
                 result.put("cacheScope", "private")
+                addModernServerMeta(result)
             }
         }
+    }
+
+    private fun addModernServerMeta(result: JSONObject): JSONObject = result.put(
+        "_meta",
+        JSONObject().put(
+            META_SERVER_INFO,
+            JSONObject().put("name", "BrowserDiag").put("title", "BrowserDiag Android MCP").put("version", APP_VERSION)
+        )
+    )
 
     private fun mcpToolDefinitions(protocolVersion: String): JSONArray {
         fun stringProperty(description: String, values: List<String>? = null): JSONObject =
@@ -470,6 +574,18 @@ class DiagServer(
         }
 
         return JSONArray()
+            .put(tool(
+                "BrowserDiag",
+                "BrowserDiag 统一入口",
+                "BrowserDiag MCP 的兼容总入口。action=capabilities 可确认工具包已注入；也可代理调用任一 browser_* 原子工具。优先直接调用具体工具。",
+                props(
+                    "action" to stringProperty(
+                        "capabilities 或要代理调用的 BrowserDiag 原子工具名",
+                        listOf("capabilities") + tools().filter { it != "BrowserDiag" }
+                    ),
+                    "arguments" to objectProperty("代理工具的参数对象")
+                )
+            ))
             .put(tool("browser_state", "浏览器状态", "获取当前页面标题、URL、加载状态与错误统计"))
             .put(tool(
                 "browser_open", "打开网页", "在当前标签打开 HTTP(S) 页面并等待加载",
@@ -537,6 +653,24 @@ class DiagServer(
             .put(tool("browser_close", "关闭当前页面", "停止加载并把当前 WebView 重置为 about:blank"))
     }
 
+    private fun browserDiagFacade(params: JSONObject): JSONObject {
+        val action = params.optString("action", "capabilities").trim().ifEmpty { "capabilities" }
+        if (action == "capabilities") {
+            return JSONObject()
+                .put("name", "BrowserDiag")
+                .put("version", APP_VERSION)
+                .put("mcpProtocolVersions", JSONArray(MCP_SUPPORTED_VERSIONS))
+                .put("tools", JSONArray(tools().filter { it != "BrowserDiag" }))
+                .put("toolCount", tools().size)
+        }
+        if (action == "BrowserDiag" || action !in tools()) {
+            return JSONObject()
+                .put("error", "unknown BrowserDiag action: $action")
+                .put("actions", JSONArray(listOf("capabilities") + tools().filter { it != "BrowserDiag" }))
+        }
+        return executeTool(action, params.optJSONObject("arguments") ?: JSONObject())
+    }
+
     private fun supportsToolTitle(protocolVersion: String): Boolean =
         protocolVersion == MCP_CURRENT_VERSION ||
             protocolVersion == MCP_LEGACY_VERSION ||
@@ -547,10 +681,15 @@ class DiagServer(
             protocolVersion == MCP_LEGACY_VERSION ||
             protocolVersion == "2025-06-18"
 
-    private fun jsonRpcError(id: Any?, code: Int, message: String): JSONObject = JSONObject()
+    private fun jsonRpcError(id: Any?, code: Int, message: String, data: JSONObject? = null): JSONObject = JSONObject()
         .put("jsonrpc", "2.0")
         .put("id", id ?: JSONObject.NULL)
-        .put("error", JSONObject().put("code", code).put("message", message))
+        .put(
+            "error",
+            JSONObject().put("code", code).put("message", message).also { error ->
+                data?.let { error.put("data", it) }
+            }
+        )
 
     private fun mcpAcceptedResponse(session: IHTTPSession): Response =
         newFixedLengthResponse(Response.Status.ACCEPTED, "application/json; charset=utf-8", "").also {
@@ -562,7 +701,10 @@ class DiagServer(
         status: Response.Status,
         code: Int,
         message: String
-    ): Response = mcpJsonResponse(session, status, jsonRpcError(JSONObject.NULL, code, message).toString())
+    ): Response {
+        McpDiagnostics.recordReject("HTTP $status: $message")
+        return mcpJsonResponse(session, status, jsonRpcError(JSONObject.NULL, code, message).toString())
+    }
 
     private fun mcpJsonResponse(session: IHTTPSession, status: Response.Status, json: String): Response =
         newFixedLengthResponse(status, "application/json; charset=utf-8", json).also {
@@ -578,7 +720,7 @@ class DiagServer(
         response.addHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         response.addHeader(
             "Access-Control-Allow-Headers",
-            "Content-Type, Authorization, X-BrowserDiag-Token, MCP-Protocol-Version, Mcp-Method, Mcp-Name, Mcp-Session-Id"
+            "Content-Type, Authorization, X-BrowserDiag-Token, MCP-Protocol-Version, Mcp-Method, Mcp-Name, Mcp-Session-Id, Access-Control-Request-Private-Network"
         )
         response.addHeader(
             "Access-Control-Expose-Headers",
@@ -587,6 +729,11 @@ class DiagServer(
         header(session, "MCP-Protocol-Version")
             ?.takeIf { it.isNotBlank() }
             ?.let { response.addHeader("MCP-Protocol-Version", it) }
+        if (header(session, "Access-Control-Request-Private-Network").equals("true", ignoreCase = true) &&
+            !origin.isNullOrBlank() && isTrustedOriginValue(origin)
+        ) {
+            response.addHeader("Access-Control-Allow-Private-Network", "true")
+        }
         response.addHeader("Cache-Control", "no-store")
         response.addHeader("X-Content-Type-Options", "nosniff")
     }
@@ -599,14 +746,21 @@ class DiagServer(
 
     private fun isTrustedMcpOrigin(session: IHTTPSession): Boolean {
         val origin = header(session, "Origin") ?: return true
+        // file:// / sandbox WebView 会发 Origin: null；只有携带有效 Token 时才允许，避免放宽 DNS rebinding 防线。
+        if (origin.equals("null", ignoreCase = true)) return isAuthorized(session)
         return isTrustedOriginValue(origin)
     }
 
-    /** 只接受 localhost 或字面私网 IP Origin，避免 DNS rebinding 域名借浏览器访问本地 MCP。 */
+    /** 只接受 localhost、可信本地 App scheme 或字面私网 IP Origin，避免 DNS rebinding 域名借浏览器访问本地 MCP。 */
     private fun isTrustedOriginValue(origin: String): Boolean {
-        val url = runCatching { URL(origin) }.getOrNull() ?: return false
-        if (!url.protocol.equals("http", true) && !url.protocol.equals("https", true)) return false
-        val host = url.host.lowercase()
+        val uri = runCatching { URI(origin) }.getOrNull() ?: return false
+        val scheme = uri.scheme?.lowercase().orEmpty()
+        val host = uri.host?.lowercase().orEmpty()
+        if (host.isEmpty()) return false
+        if (scheme in LOCAL_APP_ORIGIN_SCHEMES) {
+            return host == "localhost" || host == "127.0.0.1" || host == "::1"
+        }
+        if (scheme != "http" && scheme != "https") return false
         if (host == "localhost") return true
         val ipv6 = host.removePrefix("[").removeSuffix("]")
         if (ipv6.contains(':')) {
@@ -954,7 +1108,7 @@ class DiagServer(
             val timeout = params.optInt("timeoutMs", 10000).coerceIn(1000, 30000)
             conn.connectTimeout = timeout
             conn.readTimeout = timeout
-            conn.setRequestProperty("User-Agent", "BrowserDiag/3.7")
+            conn.setRequestProperty("User-Agent", "BrowserDiag/3.8")
             conn.setRequestProperty("Accept", "*/*")
             // 附加请求头（JSON 对象）
             val headers = params.optJSONObject("headers")
@@ -1128,14 +1282,20 @@ class DiagServer(
         private const val MAX_REQUEST_BYTES = 256 * 1024
         private const val MAX_HTTP_RESPONSE_BYTES = 512 * 1024
         private const val MAX_SOURCE_CHARS = 500_000
-        private const val APP_VERSION = "3.7.0"
+        private const val APP_VERSION = "3.8.0"
         private const val MCP_CURRENT_VERSION = "2026-07-28"
         private const val MCP_LEGACY_VERSION = "2025-11-25"
         private const val MCP_HTTP_FALLBACK_VERSION = "2025-03-26"
         private const val MCP_SSE_VERSION = "2024-11-05"
         private const val MAX_LEGACY_SSE_SESSIONS = 8
+        private const val META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion"
+        private const val META_CLIENT_INFO = "io.modelcontextprotocol/clientInfo"
+        private const val META_CLIENT_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities"
+        private const val META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
         private const val MCP_INSTRUCTIONS =
-            "BrowserDiag controls and diagnoses the Android WebView. Use browser_state before mutating navigation; network rewrite rules are managed by browser_network_rules."
+            "BrowserDiag controls and diagnoses the Android WebView. The BrowserDiag tool is a compatibility facade; prefer browser_state/browser_open and other browser_* atomic tools. Network rewrite rules are managed by browser_network_rules."
+        private val MODERN_MCP_METHODS = setOf("server/discover", "tools/list", "tools/call")
+        private val LOCAL_APP_ORIGIN_SCHEMES = setOf("app", "capacitor", "ionic", "tauri")
         private val MCP_SUPPORTED_VERSIONS = listOf(
             MCP_CURRENT_VERSION,
             MCP_LEGACY_VERSION,

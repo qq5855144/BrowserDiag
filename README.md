@@ -1,9 +1,18 @@
-# BrowserDiag v3.7
+# BrowserDiag v3.8
 
 BrowserDiag 是面向 AI 与开发者的 Web 浏览器诊断工具，包含两个运行形态：
 
 1. **Node MCP 服务**（`mcp-server/`）：提供 MCP stdio、CLI 和带 Token 认证的 HTTP 模式，基于 Playwright/Chromium。
 2. **Android APK**（`android/`）：独立 WebView 浏览器，内置原生 MCP Streamable HTTP 服务，并保留 Token HTTP Bridge 兼容路由，可按需开启局域网访问。
+
+## v3.8 MCP dual-era 与可发现性修复
+
+- 修正 v3.7 对 `2026-07-28` 的“版本已声明但协议模型仍偏 2025”问题：2026 请求现在从 `params._meta` 读取 `io.modelcontextprotocol/protocolVersion`、客户端能力与客户端信息，并与 HTTP 协议 Header 做一致性校验。
+- 2026 `server/discover`、`tools/list`、`tools/call` 使用无状态请求模型；工具列表/调用结果带 `resultType`，可缓存列表带 `ttlMs` / `cacheScope`，响应 `_meta` 标识 BrowserDiag Server。2025.x 仍走 `initialize` legacy 语义，两代协议互不污染。
+- MCP 工具列表新增字面名称 `BrowserDiag` 的兼容总入口，同时继续保留全部 `browser_*` 原子工具；AI 既可以明确发现 BrowserDiag，也可以按细粒度 Schema 精确调用浏览、诊断和网络能力。
+- 旧 SSE 进一步兼容 `Accept: */*` 的移动客户端，并支持 `/sse`、`/mcp/sse`、`/messages`、`/mcp/messages` 路径；`POST /sse?sessionId=...` 也可作为兼容消息入口。
+- Origin 兼容 Android WebView 常见的 `app://localhost`、`capacitor://localhost`、`ionic://localhost`、`tauri://localhost`，同时继续拒绝公网域名 Origin；可信 Origin 的 Private Network Access 预检会显式响应。
+- 「MCP 工具发现诊断」新增 `server/discover`、最后返回工具数、协议拒绝次数与最后问题。若 `tools/list > 0` 且返回工具数大于 0，而模型仍看不到工具，即可确定问题已发生在 AI 客户端的工具注入/会话层。
 
 ## v3.7 MCP 客户端兼容与工具发现
 
@@ -159,7 +168,18 @@ Authorization: Bearer YOUR_MCP_TOKEN
 http://PHONE_IP:8788/sse
 ```
 
-若客户端显示“MCP 已连接”但模型仍声称没有 BrowserDiag 工具，请打开「工具 → 开发者工具 → MCP 工具发现诊断」：`tools/list=0` 说明客户端没有请求工具；`tools/list>0` 则说明 BrowserDiag 已返回工具，此时应在 AI 客户端重新加载 MCP Server，并新建/刷新会话以让模型重新取得工具列表。
+若客户端显示“MCP 已连接”但模型仍声称没有 BrowserDiag 工具，请打开「工具 → 开发者工具 → MCP 工具发现诊断」：2026 客户端应能看到 `server/discover` 请求，2025/旧客户端通常会看到 `initialize`；`tools/list=0` 说明客户端没有请求工具；`tools/list>0` 且“最后返回工具”>0 表示 BrowserDiag 已实际返回工具，此时问题在 AI 客户端的工具注入/会话层，应重新加载 MCP Server 并新建/刷新会话。
+
+当前 `2026-07-28` `tools/list` 烟测示例（返回中应同时出现 `BrowserDiag` 与 `browser_open` 等工具）：
+
+```bash
+curl -s -X POST http://PHONE_IP:8788/mcp \
+  -H "Authorization: Bearer YOUR_MCP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "MCP-Protocol-Version: 2026-07-28" \
+  -H "Mcp-Method: tools/list" \
+  -d '{"jsonrpc":"2.0","id":"tools-1","method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"smoke-test","version":"1"},"io.modelcontextprotocol/clientCapabilities":{}}}}'
+```
 
 原生 MCP `initialize` 烟测示例：
 

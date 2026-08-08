@@ -81,7 +81,7 @@ import java.util.Locale
 import java.util.WeakHashMap
 
 /**
- * BrowserDiag 3.7：Chrome 风格底部导航浏览器 + 多协议 MCP + 网络实验室。
+ * BrowserDiag 3.8：Chrome 风格底部导航浏览器 + dual-era MCP + 网络实验室。
  * 功能：多标签 / 搜索引擎切换 / UA 切换 / 深色主题 / 油猴脚本 / 书签 / 保存页面 / 分享 /
  * 页面查找 / 翻译 / 媒体嗅探 / 页面资源 / 源码 zip / 语音播报 / 二维码 / 添加到桌面 / 历史。
  * 平时可作普通浏览器使用，也可作为诊断后端供其它 AI 工具通过 HTTP 调用。
@@ -1386,7 +1386,7 @@ class MainActivity : AppCompatActivity() {
                     if (settings.mcpUrlOnlyCompatibility) "已开启 · 仅限可信局域网" else "已关闭 · 推荐 Token 模式"
                 ) { toggleMcpUrlOnlyCompatibility() },
                 MenuItem("menuconfig", R.drawable.ic_settings, "常用工具设置", "选择工具中心的常用快捷入口") { showMenuConfig() },
-                MenuItem("about", R.drawable.ic_info, "关于 BrowserDiag", "v3.7.0 · MCP ${serverPort}") { showAbout() }
+                MenuItem("about", R.drawable.ic_info, "关于 BrowserDiag", "v3.8.0 · MCP ${serverPort}") { showAbout() }
             )
         )
     )
@@ -2271,7 +2271,7 @@ class MainActivity : AppCompatActivity() {
                 }
             ))
             content.addView(TextView(this).apply {
-                text = "这里是真正的 MCP 服务：支持 2026-07-28 server/discover、2025.x Streamable HTTP，并提供 2024-11-05 HTTP+SSE 兼容入口。后台保活开启后，切到 AI 客户端或锁屏仍由前台服务维持 MCP；若客户端显示已连接但模型看不到 browser_*，请查看上方“工具发现诊断”。推荐使用 Bearer Token，URL-only 仅在可信网络使用。"
+                text = "这里是真正的 dual-era MCP 服务：原生支持 2026-07-28 无状态 server/discover + 每请求 _meta，同时兼容 2025.x initialize 与 2024-11-05 HTTP+SSE。工具列表包含 BrowserDiag 统一兼容入口和 browser_* 原子工具。若客户端显示已连接但模型仍看不到工具，请查看上方“工具发现诊断”。推荐使用 Bearer Token，URL-only 仅在可信网络使用。"
                 textSize = 12.5f
                 setTextColor(secondaryTextColor())
                 setPadding(14.dp(), 16.dp(), 14.dp(), 8.dp())
@@ -2288,21 +2288,25 @@ class MainActivity : AppCompatActivity() {
         AlertDialog.Builder(this)
             .setTitle("MCP 工具发现诊断")
             .setMessage(
-                "initialize：${diag.initializeCount}\n" +
+                "server/discover：${diag.serverDiscoverCount}\n" +
+                    "initialize：${diag.initializeCount}\n" +
                     "tools/list：${diag.toolsListCount}\n" +
+                    "最后返回工具：${diag.lastToolsReturned}\n" +
                     "tools/call：${diag.toolsCallCount}\n\n" +
+                    "协议拒绝：${diag.rejectionCount}\n" +
                     "最后方法：${diag.lastMethod}\n" +
                     "Transport：${diag.lastTransport}\n" +
                     "协议：${diag.lastProtocol}\n" +
                     "客户端：${diag.lastClient}\n" +
+                    "最后问题：${diag.lastIssue}\n" +
                     "时间：$age\n\n" +
-                    "判读：initialize=0 表示客户端没有完成 MCP 握手；tools/list=0 表示客户端没有请求 BrowserDiag 工具；tools/list>0 但模型仍看不到 browser_*，说明工具已由 BrowserDiag 返回，问题位于 AI 客户端的工具注入/会话刷新层。"
+                    "判读：2026 客户端通常会出现 server/discover，2025/更旧客户端会出现 initialize；tools/list=0 表示客户端没有请求 BrowserDiag 工具；tools/list>0 且“最后返回工具”>0，但模型仍看不到 BrowserDiag/browser_*，说明工具已经由服务端返回，问题位于 AI 客户端的工具注入或会话刷新层。"
             )
             .setNegativeButton("关闭", null)
             .setPositiveButton("复制诊断") { _, _ ->
                 copyText(
-                    "BrowserDiag MCP: ${diag.summary()}, method=${diag.lastMethod}, " +
-                        "transport=${diag.lastTransport}, protocol=${diag.lastProtocol}, client=${diag.lastClient}"
+                    "BrowserDiag MCP: ${diag.summary()}, rejected=${diag.rejectionCount}, method=${diag.lastMethod}, " +
+                        "transport=${diag.lastTransport}, protocol=${diag.lastProtocol}, client=${diag.lastClient}, issue=${diag.lastIssue}"
                 )
             }
             .show()
@@ -2834,8 +2838,8 @@ class MainActivity : AppCompatActivity() {
         val api = apiBaseUrl()
         val token = settings.apiToken
         val ua = currentWeb()?.settings?.userAgentString ?: ""
-        showBrowserSheet("BrowserDiag", "安全浏览 + 页面诊断 · v3.7.0") { content, _ ->
-            content.addView(panelRow(R.drawable.ic_info, "BrowserDiag 3.7.0", "Android 浏览器、网络实验室与多协议 MCP 服务"))
+        showBrowserSheet("BrowserDiag", "安全浏览 + 页面诊断 · v3.8.0") { content, _ ->
+            content.addView(panelRow(R.drawable.ic_info, "BrowserDiag 3.8.0", "Android 浏览器、网络实验室与 dual-era MCP 服务"))
             content.addView(panelRow(R.drawable.ic_network, "MCP Streamable HTTP", "${mcpEndpointUrl()} · Token 认证", onClick = {
                 copyText(mcpEndpointUrl())
             }))
