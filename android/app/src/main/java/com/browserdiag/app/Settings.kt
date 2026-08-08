@@ -243,7 +243,7 @@ class Settings(private val ctx: Context) {
         get() = prefs.getBoolean("debug_web", false)
         set(v) = prefs.edit().putBoolean("debug_web", v).apply()
 
-    // ---------- 诊断 API 安全 ----------
+    // ---------- MCP HTTP Bridge 安全 ----------
     var lanApiEnabled: Boolean
         get() = prefs.getBoolean("lan_api_enabled", false)
         set(v) = prefs.edit().putBoolean("lan_api_enabled", v).apply()

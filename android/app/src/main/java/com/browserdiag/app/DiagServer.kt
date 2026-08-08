@@ -20,8 +20,8 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 /**
- * Android 内嵌诊断 HTTP API。
- * 默认仅监听 loopback；所有操作均要求调用方提供随机 API Token。
+ * Android 内嵌 MCP 调用 HTTP Bridge。
+ * 默认仅监听 loopback；所有操作均要求调用方提供随机 MCP Token。
  */
 class DiagServer(
     listenHost: String,

@@ -511,8 +511,8 @@ class MainActivity : AppCompatActivity() {
     private fun buildStatusText(): String {
         val errs = synchronized(consoleLogs) { consoleLogs.filter { it.optString("type") == "error" }.size }
         val scope = if (settings.lanApiEnabled) "局域网" else "本机"
-        val api = if (server == null) "API 未启动" else "API $scope:${serverPort}"
-        return "$api  ·  Console ${consoleLogs.size}/$errs  ·  点击诊断"
+        val mcp = if (server == null) "MCP 接口未启动" else "MCP $scope:${serverPort}"
+        return "$mcp  ·  Console ${consoleLogs.size}/$errs  ·  点击诊断"
     }
 
     private fun reloadOrStop() {
@@ -797,7 +797,7 @@ class MainActivity : AppCompatActivity() {
                 copyText(url)
                 dialog.dismiss()
             }))
-            content.addView(panelRow(R.drawable.ic_tools, "页面诊断", "查看 API、Console 与当前标签状态", onClick = {
+            content.addView(panelRow(R.drawable.ic_tools, "页面诊断", "查看 MCP 接口、Console 与当前标签状态", onClick = {
                 dialog.dismiss()
                 devTools()
             }))
@@ -1170,9 +1170,9 @@ class MainActivity : AppCompatActivity() {
             listOf(
                 MenuItem("sniff", R.drawable.ic_movie, "媒体嗅探", "智能识别视频、音频、HLS/DASH 清单并折叠分片") { sniffMedia() },
                 MenuItem("resources", R.drawable.ic_folder, "页面资源", "分类识别图片、脚本、样式、字体与媒体") { pageResources() },
-                MenuItem("source", R.drawable.ic_code, "源码归档", "导出 HTML、资源、Console 与网络日志") { downloadSourceZip() },
+                MenuItem("source", R.drawable.ic_code, "递归源码归档", "递归打包 HTML、CSS/JS、图片、字体、source map 与诊断日志") { downloadSourceZip() },
                 MenuItem("netlog", R.drawable.ic_network, "网络日志", "查看请求状态、类型、大小与耗时") { showNetLog() },
-                MenuItem("devtools", R.drawable.ic_tools, "开发者工具", "诊断 API、Console 与页面状态") { devTools() }
+                MenuItem("devtools", R.drawable.ic_tools, "开发者工具", "MCP 接口、Console 与页面状态") { devTools() }
             )
         ),
         ToolCategory(
@@ -1193,11 +1193,11 @@ class MainActivity : AppCompatActivity() {
         ToolCategory(
             "BrowserDiag",
             R.drawable.ic_info,
-            if (settings.lanApiEnabled) "诊断 API 已允许局域网访问" else "诊断 API 仅限本机",
+            if (settings.lanApiEnabled) "MCP 接口已允许局域网访问" else "MCP 接口仅限本机",
             listOf(
-                MenuItem("lanapi", R.drawable.ic_link, "局域网诊断 API", if (settings.lanApiEnabled) "已开启 · Token 认证" else "已关闭 · 仅本机") { toggleLanApi() },
+                MenuItem("lanapi", R.drawable.ic_link, "局域网 MCP 接口", if (settings.lanApiEnabled) "已开启 · HTTP Bridge · Token 认证" else "已关闭 · 仅本机") { toggleLanApi() },
                 MenuItem("menuconfig", R.drawable.ic_settings, "常用工具设置", "选择工具中心的常用快捷入口") { showMenuConfig() },
-                MenuItem("about", R.drawable.ic_info, "关于 BrowserDiag", "v3.3.0 · API ${serverPort}") { showAbout() }
+                MenuItem("about", R.drawable.ic_info, "关于 BrowserDiag", "v3.3.0 · MCP ${serverPort}") { showAbout() }
             )
         )
     )
@@ -1996,13 +1996,13 @@ class MainActivity : AppCompatActivity() {
             content.addView(sectionTitle("连接"))
             content.addView(panelRow(
                 R.drawable.ic_network,
-                "诊断 API",
-                "$api · ${if (settings.lanApiEnabled) "局域网 + 本机" else "仅本机"}",
+                "MCP 接口",
+                "$api · HTTP Bridge · ${if (settings.lanApiEnabled) "局域网 + 本机" else "仅本机"}",
                 onClick = { copyText(api) }
             ))
             content.addView(panelRow(
                 R.drawable.ic_lock,
-                "访问 Token",
+                "MCP Token",
                 "${token.take(6)}…${token.takeLast(4)} · 点击复制完整 Token",
                 onClick = { copyText(token) }
             ))
@@ -2031,7 +2031,7 @@ class MainActivity : AppCompatActivity() {
                 }
             ))
             content.addView(TextView(this).apply {
-                text = "HTTP 调用必须携带 Authorization: Bearer <token>。支持页面状态、Console、Network、Eval、截图、性能、报告、源码等诊断能力。"
+                text = "此处是供 MCP / AI 工具调用的 HTTP Bridge，并非原生 MCP transport。调用必须携带 Authorization: Bearer <token>，支持页面状态、Console、Network、Eval、截图、性能、报告与源码等能力。"
                 textSize = 12.5f
                 setTextColor(secondaryTextColor())
                 setPadding(14.dp(), 16.dp(), 14.dp(), 8.dp())
@@ -2567,10 +2567,10 @@ class MainActivity : AppCompatActivity() {
         val ua = currentWeb()?.settings?.userAgentString ?: ""
         showBrowserSheet("BrowserDiag", "安全浏览 + 页面诊断 · v3.3.0") { content, _ ->
             content.addView(panelRow(R.drawable.ic_info, "BrowserDiag 3.3.0", "Android 浏览器与诊断后端"))
-            content.addView(panelRow(R.drawable.ic_network, "HTTP API", "$api · Token 认证", onClick = {
+            content.addView(panelRow(R.drawable.ic_network, "MCP 接口", "$api · HTTP Bridge · Token 认证", onClick = {
                 copyText(api)
             }))
-            content.addView(panelRow(R.drawable.ic_lock, "API Token", "${token.take(6)}…${token.takeLast(4)} · 点击复制", onClick = {
+            content.addView(panelRow(R.drawable.ic_lock, "MCP Token", "${token.take(6)}…${token.takeLast(4)} · 点击复制", onClick = {
                 copyText(token)
             }))
             content.addView(panelRow(R.drawable.ic_phone, "当前 User-Agent", ua.take(150)))
@@ -2583,7 +2583,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ==================== 源码 zip（保留 v2.1） ====================
+    // ==================== 递归源码 ZIP ====================
     private fun downloadSourceZip() {
         if (!ensureLegacyDownloadsPermission()) return
         val wv = currentWeb() ?: return
@@ -2603,18 +2603,27 @@ class MainActivity : AppCompatActivity() {
             val consoleJson = synchronized(consoleLogs) { JSONArray(consoleLogs.toList()).toString() }
             wv.evaluateJavascript("JSON.stringify(window.__bdNet||[])") { netRaw ->
                 val netJson = decodeJsArray(netRaw).toString()
-                SourcePacker.pack(
-                    context = this,
-                    url = currentUrl,
-                    title = tabs.current?.title.orEmpty(),
-                    html = html,
-                    consoleJson = consoleJson,
-                    networkJson = netJson,
-                    ua = wv.settings.userAgentString
-                ) { ok, msg ->
-                    runOnUiThread {
-                        statusBar.text = if (ok) "源码已保存 ✅ $msg" else "打包失败 ❌ $msg"
-                        toast(if (ok) "网页源码已保存：$msg" else "打包失败：$msg")
+                wv.evaluateJavascript(
+                    "JSON.stringify(Array.from(new Set((performance.getEntriesByType('resource')||[]).filter(function(e){var t=(e.initiatorType||'').toLowerCase();return t!=='fetch'&&t!=='xmlhttprequest'&&t!=='beacon';}).map(function(e){return e.name;}).filter(Boolean))).slice(0,240))"
+                ) { resourcesRaw ->
+                    val observedResourcesJson = decodeJsArray(resourcesRaw).toString()
+                    SourcePacker.pack(
+                        context = this,
+                        url = currentUrl,
+                        title = tabs.current?.title.orEmpty(),
+                        html = html,
+                        consoleJson = consoleJson,
+                        networkJson = netJson,
+                        observedResourcesJson = observedResourcesJson,
+                        ua = wv.settings.userAgentString,
+                        onProgress = { progress ->
+                            runOnUiThread { statusBar.text = progress }
+                        }
+                    ) { ok, msg ->
+                        runOnUiThread {
+                            statusBar.text = if (ok) "源码归档完成 ✅" else "打包失败 ❌ $msg"
+                            toast(if (ok) "递归源码 ZIP 已保存：$msg" else "打包失败：$msg")
+                        }
                     }
                 }
             }
@@ -3000,13 +3009,13 @@ class MainActivity : AppCompatActivity() {
         toast(if (settings.debugWeb) "已开启 WebView 远程调试（chrome://inspect 可连接）" else "已关闭远程调试")
     }
 
-    /** 默认仅本机访问；显式开启后才监听局域网地址，仍必须携带 API Token。 */
+    /** MCP 调用 HTTP Bridge 默认仅本机访问；显式开启后才监听局域网地址，仍必须携带 Token。 */
     private fun toggleLanApi() {
         settings.lanApiEnabled = !settings.lanApiEnabled
         restartServer()
         toast(
-            if (settings.lanApiEnabled) "局域网 API 已开启（Token 认证仍然有效）"
-            else "局域网 API 已关闭，仅本机可访问"
+            if (settings.lanApiEnabled) "局域网 MCP 接口已开启（HTTP Bridge · Token 认证）"
+            else "局域网 MCP 接口已关闭，仅本机可访问"
         )
     }
 
@@ -3179,7 +3188,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
         if (!started) {
-            statusBar.text = "API 服务启动失败（端口 8788-8791 均被占用）"
+            statusBar.text = "MCP 接口启动失败（端口 8788-8791 均被占用）"
         } else {
             statusBar.text = buildStatusText()
         }
