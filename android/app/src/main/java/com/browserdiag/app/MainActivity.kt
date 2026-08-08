@@ -28,6 +28,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
 import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
 import android.webkit.DownloadListener
@@ -47,6 +48,7 @@ import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -107,6 +109,7 @@ class MainActivity : AppCompatActivity() {
     private var isFullscreen = false
     private var userscriptInstallBusy = false
     private var mainMenuDialog: Dialog? = null
+    private var lastExitBackPressedAt = 0L
 
     // Chrome / Material 3 风格调色板。手动主题与系统组件主题保持同步。
     private fun surfaceColor() = if (isDark) 0xFF202124.toInt() else 0xFFF8FAFD.toInt()
@@ -132,9 +135,22 @@ class MainActivity : AppCompatActivity() {
         WebView.setWebContentsDebuggingEnabled(settings.debugWeb)
         applySavedOrientation()
         buildUi()
+        installBackNavigation()
         newTab(initialUrlFromIntent(intent) ?: settings.engine.homeUrl)
         startServer()
         applyTheme()
+    }
+
+    /**
+     * 系统返回键/返回手势使用浏览器语义，而不是直接交给 Activity 退出。
+     * 只有单标签已停在主页且用户在短时间内再次返回时才真正退出。
+     */
+    private fun installBackNavigation() {
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                handleBrowserBack()
+            }
+        })
     }
 
     // ==================== 崩溃捕获 ====================
@@ -1096,7 +1112,7 @@ class MainActivity : AppCompatActivity() {
                 wv.loadUrl("https://$q")
             else -> wv.loadUrl(engine.searchUrl.format(URLEncoder.encode(q, "UTF-8")))
         }
-        urlInput.clearFocus()
+        clearFocusAndKeyboard(urlInput)
     }
 
     /** 识别 example.com/path、IP:port、localhost 等常见地址，避免被错误送去搜索。 */
@@ -1457,7 +1473,14 @@ class MainActivity : AppCompatActivity() {
 
     private fun hideFindBar() {
         findBar.visibility = View.GONE
+        clearFocusAndKeyboard(findInput)
         currentWeb()?.clearMatches()
+    }
+
+    private fun clearFocusAndKeyboard(view: View) {
+        view.clearFocus()
+        (getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager)
+            ?.hideSoftInputFromWindow(view.windowToken, 0)
     }
 
     private fun findNext(forward: Boolean) {
@@ -3191,21 +3214,65 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
-    override fun onBackPressed() {
+    private fun handleBrowserBack() {
         if (isFullscreen) {
+            lastExitBackPressedAt = 0L
             setFullscreen(false)
             return
         }
         if (findBar.visibility == View.VISIBLE) {
+            lastExitBackPressedAt = 0L
             hideFindBar()
             return
         }
+        if (urlInput.hasFocus()) {
+            lastExitBackPressedAt = 0L
+            clearFocusAndKeyboard(urlInput)
+            setOmniboxUrl(currentWeb()?.url.orEmpty())
+            updateChromeControls()
+            return
+        }
         val wv = currentWeb()
-        if (wv != null && wv.canGoBack()) wv.goBack() else super.onBackPressed()
+        if (wv != null && wv.canGoBack()) {
+            lastExitBackPressedAt = 0L
+            wv.goBack()
+            return
+        }
+        if (tabs.size > 1) {
+            lastExitBackPressedAt = 0L
+            val currentId = tabs.current?.id
+            if (currentId != null) {
+                closeTabAndKeepBrowser(currentId)
+                toast("已关闭当前标签页")
+            }
+            return
+        }
+        if (wv != null && !isConfiguredHomePage(wv.url.orEmpty())) {
+            lastExitBackPressedAt = 0L
+            goHome()
+            toast("已返回主页")
+            return
+        }
+
+        val now = System.currentTimeMillis()
+        if (now - lastExitBackPressedAt <= BACK_TO_EXIT_INTERVAL_MS) {
+            finish()
+        } else {
+            lastExitBackPressedAt = now
+            toast("再按一次返回退出 BrowserDiag")
+        }
+    }
+
+    private fun isConfiguredHomePage(url: String): Boolean {
+        val current = runCatching { Uri.parse(url) }.getOrNull() ?: return false
+        val home = runCatching { Uri.parse(settings.engine.homeUrl) }.getOrNull() ?: return false
+        if (!current.scheme.equals(home.scheme, true) || !current.host.equals(home.host, true)) return false
+        return current.path.orEmpty().trimEnd('/') == home.path.orEmpty().trimEnd('/')
     }
 
     companion object {
         private const val LEGACY_STORAGE_PERMISSION_REQUEST = 4101
+        private const val BACK_TO_EXIT_INTERVAL_MS = 2_000L
 
         /** 广告拦截域名黑名单（子域名自动匹配） */
         private val AD_BLOCK_HOSTS = listOf(
