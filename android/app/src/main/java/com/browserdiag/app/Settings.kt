@@ -44,8 +44,13 @@ data class Userscript(
     val id: String,
     val name: String,
     val enabled: Boolean,
-    val urlPattern: String,   // 匹配规则：* 通配子串，如 *youtube.com* 或 *
-    val code: String
+    val urlPattern: String,   // 可保存多条 @match / @include，以换行分隔
+    val code: String,
+    val excludePattern: String = "",
+    val sourceUrl: String = "",
+    val namespace: String = "",
+    val version: String = "",
+    val description: String = ""
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("id", id)
@@ -53,6 +58,11 @@ data class Userscript(
         .put("enabled", enabled)
         .put("urlPattern", urlPattern)
         .put("code", code)
+        .put("excludePattern", excludePattern)
+        .put("sourceUrl", sourceUrl)
+        .put("namespace", namespace)
+        .put("version", version)
+        .put("description", description)
 
     companion object {
         fun fromJson(o: JSONObject): Userscript = Userscript(
@@ -60,7 +70,12 @@ data class Userscript(
             name = o.optString("name"),
             enabled = o.optBoolean("enabled", true),
             urlPattern = o.optString("urlPattern", "*"),
-            code = o.optString("code")
+            code = o.optString("code"),
+            excludePattern = o.optString("excludePattern"),
+            sourceUrl = o.optString("sourceUrl"),
+            namespace = o.optString("namespace"),
+            version = o.optString("version"),
+            description = o.optString("description")
         )
     }
 }
@@ -138,8 +153,13 @@ class Settings(private val ctx: Context) {
             arr.put(
                 script.copy(
                     name = script.name.take(120),
-                    urlPattern = script.urlPattern.take(512),
-                    code = script.code.take(200_000)
+                    urlPattern = script.urlPattern.take(4096),
+                    code = script.code.take(200_000),
+                    excludePattern = script.excludePattern.take(4096),
+                    sourceUrl = script.sourceUrl.take(4096),
+                    namespace = script.namespace.take(200),
+                    version = script.version.take(80),
+                    description = script.description.take(500)
                 ).toJson()
             )
         }

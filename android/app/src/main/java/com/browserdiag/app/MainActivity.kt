@@ -29,6 +29,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import android.webkit.ConsoleMessage
+import android.webkit.CookieManager
 import android.webkit.DownloadListener
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -61,11 +62,14 @@ import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.PrintWriter
 import java.io.StringWriter
+import java.net.HttpURLConnection
 import java.net.Inet4Address
 import java.net.NetworkInterface
+import java.net.URL
 import java.net.URLEncoder
 import java.util.Locale
 
@@ -100,6 +104,7 @@ class MainActivity : AppCompatActivity() {
     private var tts: TextToSpeech? = null
     private var isDark = false
     private var isFullscreen = false
+    private var userscriptInstallBusy = false
     private var mainMenuDialog: Dialog? = null
 
     // Chrome / Material 3 风格调色板。手动主题与系统组件主题保持同步。
@@ -177,7 +182,7 @@ class MainActivity : AppCompatActivity() {
             )
         }
 
-        // ---- 顶部：Chrome 风格 Omnibox + 标签计数 + 更多菜单 ----
+        // ---- 顶部：Omnibox + 标签计数；全局工具统一从底栏进入 ----
         topBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -250,7 +255,6 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { showTabsDialog() }
         }
         topBar.addView(tabCountButton)
-        topBar.addView(iconBtn(R.drawable.ic_menu, 24, "工具中心") { showMainMenu() })
         root.addView(topBar)
 
         pageProgress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
@@ -848,7 +852,11 @@ class MainActivity : AppCompatActivity() {
         }
         settings.getScripts().filter { it.enabled }.forEach { s ->
             try {
-                WebViewCompat.addDocumentStartJavaScript(wv, s.code, patternToOriginRules(s.urlPattern))
+                WebViewCompat.addDocumentStartJavaScript(
+                    wv,
+                    wrapUserscriptForRuntime(s),
+                    patternToOriginRules(s.urlPattern)
+                )
             } catch (e: Exception) {
             }
         }
@@ -900,6 +908,18 @@ class MainActivity : AppCompatActivity() {
             }
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                val scriptUri = url?.let { runCatching { Uri.parse(it) }.getOrNull() }
+                if (scriptUri != null && isUserscriptUri(scriptUri)) {
+                    view?.stopLoading()
+                    val previousUrl = tabs.all.firstOrNull { it.webView === view }?.url.orEmpty()
+                    if (view?.canGoBack() == true) {
+                        view.goBack()
+                    } else if (previousUrl.isNotBlank() && previousUrl != scriptUri.toString()) {
+                        view?.loadUrl(previousUrl)
+                    }
+                    requestUserscriptInstall(scriptUri.toString())
+                    return
+                }
                 if (tabs.current?.webView === view) {
                     setOmniboxUrl(url.orEmpty())
                     updateChromeControls()
@@ -909,6 +929,14 @@ class MainActivity : AppCompatActivity() {
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                 val uri = request?.url ?: return false
                 val scheme = uri.scheme?.lowercase(Locale.ROOT)
+                if (
+                    request.isForMainFrame &&
+                    (scheme == "http" || scheme == "https") &&
+                    isUserscriptUri(uri)
+                ) {
+                    requestUserscriptInstall(uri.toString())
+                    return true
+                }
                 if (scheme == "http" || scheme == "https" || scheme == "about") return false
                 if (scheme in setOf("mailto", "tel", "sms", "geo")) {
                     try {
@@ -948,6 +976,10 @@ class MainActivity : AppCompatActivity() {
         }
 
         wv.setDownloadListener(DownloadListener { url, _, _, mimeType, _ ->
+            if (isUserscriptUri(Uri.parse(url))) {
+                requestUserscriptInstall(url)
+                return@DownloadListener
+            }
             try {
                 val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
                 val req = DownloadManager.Request(Uri.parse(url))
@@ -965,13 +997,28 @@ class MainActivity : AppCompatActivity() {
         val all = tabs.all
         showBrowserSheet(
             title = "标签页",
-            subtitle = "${all.size}/5 · 点击卡片切换标签",
+            subtitle = "${all.size}/5 · 点击切换，右侧 × 关闭单个标签",
             headerActionLabel = "＋ 新标签",
             headerAction = { dialog ->
                 newTab(settings.engine.homeUrl)
                 dialog.dismiss()
             }
         ) { content, dialog ->
+            if (all.isNotEmpty()) {
+                val actions = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    setPadding(1.dp(), 2.dp(), 1.dp(), 8.dp())
+                }
+                actions.addView(quickAction(R.drawable.ic_close, "关闭当前") {
+                    val currentId = tabs.current?.id ?: return@quickAction
+                    closeTabAndKeepBrowser(currentId)
+                    dialog.dismiss()
+                })
+                actions.addView(quickAction(R.drawable.ic_delete, "关闭全部") {
+                    confirmCloseAllTabs(dialog)
+                })
+                content.addView(actions)
+            }
             if (all.isEmpty()) {
                 content.addView(emptyPanel(R.drawable.ic_tab, "还没有标签页", "新建一个标签开始浏览"))
             }
@@ -986,11 +1033,7 @@ class MainActivity : AppCompatActivity() {
                     trailingIcon = R.drawable.ic_close,
                     selected = isCurrent,
                     onTrailing = {
-                        tabs.destroy(tab.id)
-                        if (tabs.size == 0) newTab(settings.engine.homeUrl)
-                        tabs.current?.let { setOmniboxUrl(it.url) }
-                        updateChromeControls()
-                        statusBar.text = buildStatusText()
+                        closeTabAndKeepBrowser(tab.id)
                         dialog.dismiss()
                     },
                     onClick = {
@@ -1003,6 +1046,31 @@ class MainActivity : AppCompatActivity() {
                 ))
             }
         }
+    }
+
+    private fun closeTabAndKeepBrowser(tabId: Int) {
+        tabs.destroy(tabId)
+        if (tabs.size == 0) {
+            newTab(settings.engine.homeUrl)
+        } else {
+            tabs.current?.let { setOmniboxUrl(it.url) }
+            updateChromeControls()
+            statusBar.text = buildStatusText()
+        }
+    }
+
+    private fun confirmCloseAllTabs(parentSheet: BottomSheetDialog) {
+        AlertDialog.Builder(this)
+            .setTitle("关闭全部标签页？")
+            .setMessage("将关闭当前 ${tabs.size} 个标签页，并打开一个新的主页标签。")
+            .setNegativeButton("取消", null)
+            .setPositiveButton("关闭全部") { _, _ ->
+                parentSheet.dismiss()
+                tabs.destroyAll()
+                newTab(settings.engine.homeUrl)
+                toast("已关闭全部标签页")
+            }
+            .show()
     }
 
     // ==================== 导航 ====================
@@ -1058,7 +1126,7 @@ class MainActivity : AppCompatActivity() {
             R.drawable.ic_tools,
             "媒体、资源、源码、网络与 Console",
             listOf(
-                MenuItem("sniff", R.drawable.ic_movie, "媒体嗅探", "识别 video / audio 与常见流媒体链接") { sniffMedia() },
+                MenuItem("sniff", R.drawable.ic_movie, "媒体嗅探", "智能识别视频、音频、HLS/DASH 清单并折叠分片") { sniffMedia() },
                 MenuItem("resources", R.drawable.ic_folder, "页面资源", "查看图片、脚本和样式资源") { pageResources() },
                 MenuItem("source", R.drawable.ic_code, "源码归档", "导出 HTML、资源、Console 与网络日志") { downloadSourceZip() },
                 MenuItem("netlog", R.drawable.ic_network, "网络日志", "查看当前页面最近的请求状态") { showNetLog() },
@@ -1073,7 +1141,7 @@ class MainActivity : AppCompatActivity() {
                 MenuItem("dark", R.drawable.ic_dark, "深色主题", if (isDark) "已开启" else "已关闭") { toggleDark() },
                 MenuItem("engine", R.drawable.ic_search, "搜索引擎", settings.engine.label) { showEnginePicker() },
                 MenuItem("ua", R.drawable.ic_phone, "User-Agent", settings.uaMode.label) { showUaPicker() },
-                MenuItem("userscript", R.drawable.ic_extension, "用户脚本", "${settings.getScripts().size} 个脚本") { showScriptManager() },
+                MenuItem("userscript", R.drawable.ic_extension, "用户脚本", "${settings.getScripts().size} 个脚本 · 支持网页 .user.js 安装") { showScriptManager() },
                 MenuItem("font", R.drawable.ic_font, "网页字体", "${settings.fontScale}%") { showFontScale() },
                 MenuItem("orientation", R.drawable.ic_rotate, "屏幕方向", orientationLabel()) { showOrientation() },
                 MenuItem("adblock", R.drawable.ic_shield, "广告拦截", if (settings.adBlock) "已开启" else "已关闭") { toggleAdBlock() },
@@ -1382,29 +1450,207 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ==================== 媒体嗅探 / 页面资源 ====================
+    private data class MediaCandidate(
+        val url: String,
+        val kind: String,
+        val source: String,
+        val mime: String,
+        val bytes: Long,
+        val duration: Double,
+        val width: Int,
+        val height: Int,
+        val status: Int
+    )
+
     private fun sniffMedia() {
         val wv = currentWeb() ?: return
         statusBar.text = "正在嗅探媒体资源…"
-        wv.evaluateJavascript(
-            "(function(){var out=[];document.querySelectorAll('video,audio').forEach(function(m){if(m.src)out.push(m.src);m.querySelectorAll('source').forEach(function(s){if(s.src)out.push(s.src);});});if(window.__bdNet)window.__bdNet.forEach(function(n){if(/\\.(mp4|m3u8|mp3|webm|flv|m4a|ogg|aac)(\\?|$)/i.test(n.url))out.push(n.url);});return JSON.stringify(out);})()"
-        ) { raw ->
-            val list = try {
+        wv.evaluateJavascript(MEDIA_SNIFF_JS) { raw ->
+            val candidates = try {
                 val arr = decodeJsArray(raw)
-                (0 until arr.length()).map { arr.getString(it) }
-            } catch (e: Exception) {
+                (0 until arr.length()).mapNotNull { index ->
+                    val item = arr.optJSONObject(index) ?: return@mapNotNull null
+                    val url = item.optString("url")
+                    if (url.isBlank()) return@mapNotNull null
+                    MediaCandidate(
+                        url = url,
+                        kind = item.optString("kind", "media"),
+                        source = item.optString("source"),
+                        mime = item.optString("mime"),
+                        bytes = item.optLong("bytes", 0L),
+                        duration = item.optDouble("duration", 0.0),
+                        width = item.optInt("width", 0),
+                        height = item.optInt("height", 0),
+                        status = item.optInt("status", 0)
+                    )
+                }
+            } catch (_: Exception) {
                 emptyList()
             }
             runOnUiThread {
-                if (list.isEmpty()) {
-                    statusBar.text = "未发现媒体资源"
-                    showBrowserSheet("媒体嗅探", "扫描 video / audio 与常见媒体请求") { content, _ ->
-                        content.addView(emptyPanel(R.drawable.ic_movie, "未发现媒体资源", "播放页面中的视频或音频后可再次扫描"))
-                    }
-                    return@runOnUiThread
-                }
-                statusBar.text = "发现 ${list.size} 个媒体资源"
-                showUrlListDialog("媒体资源（点击下载）", list)
+                showMediaSniffResults(candidates)
             }
+        }
+    }
+
+    private fun showMediaSniffResults(candidates: List<MediaCandidate>) {
+        val segments = candidates.count { it.kind == "segment" }
+        val visible = candidates.filter { it.kind != "segment" }
+        val videos = visible.count { it.kind == "video" }
+        val audios = visible.count { it.kind == "audio" }
+        val playlists = visible.count { it.kind == "playlist" }
+        statusBar.text = if (visible.isEmpty()) "未发现可直接使用的媒体资源" else "发现 ${visible.size} 个媒体资源"
+        val summary = buildList {
+            if (videos > 0) add("视频 $videos")
+            if (audios > 0) add("音频 $audios")
+            if (playlists > 0) add("流媒体清单 $playlists")
+            if (segments > 0) add("已折叠分片 $segments")
+        }.joinToString(" · ").ifBlank { "DOM + Performance + 网络请求智能识别" }
+
+        showBrowserSheet(
+            title = "媒体嗅探",
+            subtitle = summary,
+            headerActionLabel = "重新扫描",
+            headerAction = { dialog ->
+                dialog.dismiss()
+                sniffMedia()
+            }
+        ) { content, _ ->
+            content.addView(panelRow(
+                R.drawable.ic_info,
+                "智能识别",
+                "已合并页面媒体、Performance 与 XHR/fetch，并自动去重；播放媒体后重新扫描可获得更多结果。"
+            ))
+            if (visible.isEmpty()) {
+                content.addView(emptyPanel(
+                    R.drawable.ic_movie,
+                    "暂未发现可直接使用的媒体",
+                    if (segments > 0) "已检测到 $segments 个媒体分片并自动折叠；继续播放后重扫以寻找 M3U8/MPD 清单。"
+                    else "先播放页面中的视频或音频，再点击“重新扫描”。"
+                ))
+                return@showBrowserSheet
+            }
+            visible.forEach { media ->
+                val blobUrl = media.url.startsWith("blob:", true)
+                val title = mediaDisplayTitle(media)
+                val subtitle = mediaDisplaySubtitle(media)
+                content.addView(panelRow(
+                    iconRes = when (media.kind) {
+                        "audio" -> R.drawable.ic_mic
+                        "playlist" -> R.drawable.ic_network
+                        else -> R.drawable.ic_movie
+                    },
+                    title = title,
+                    subtitle = subtitle,
+                    trailingIcon = if (blobUrl) null else R.drawable.ic_download,
+                    onTrailing = if (blobUrl) null else ({ enqueueMediaDownload(media) }),
+                    onClick = { showMediaActions(media) }
+                ))
+            }
+        }
+    }
+
+    private fun mediaDisplayTitle(media: MediaCandidate): String {
+        val kind = when (media.kind) {
+            "video" -> "视频"
+            "audio" -> "音频"
+            "playlist" -> "流媒体清单"
+            else -> "媒体"
+        }
+        val format = mediaFormat(media)
+        val file = runCatching {
+            Uri.parse(media.url).lastPathSegment.orEmpty().substringBefore('?').takeLast(54)
+        }.getOrDefault("")
+        return listOf(kind, format, file).filter { it.isNotBlank() }.distinct().joinToString(" · ").take(90)
+    }
+
+    private fun mediaDisplaySubtitle(media: MediaCandidate): String = buildList {
+        if (media.url.startsWith("blob:", true)) add("页面 Blob 临时流")
+        else displayHost(media.url).takeIf { it.isNotBlank() }?.let { add(it) }
+        media.source.takeIf { it.isNotBlank() }?.let { add(it) }
+        if (media.width > 0 && media.height > 0) add("${media.width}×${media.height}")
+        if (media.duration > 0 && media.duration.isFinite()) add(formatDuration(media.duration))
+        if (media.bytes > 0) add(formatBytes(media.bytes))
+        if (media.status > 0) add("HTTP ${media.status}")
+        media.mime.takeIf { it.isNotBlank() }?.let { add(it.substringBefore(';')) }
+    }.joinToString(" · ").take(220)
+
+    private fun mediaFormat(media: MediaCandidate): String {
+        val path = runCatching { Uri.parse(media.url).path.orEmpty().lowercase(Locale.ROOT) }.getOrDefault("")
+        val extension = path.substringAfterLast('.', "").takeIf { it.length in 2..6 }
+        if (extension != null) return extension.uppercase(Locale.ROOT)
+        val subtype = media.mime.substringAfter('/', "").substringBefore(';').substringBefore('+')
+        return subtype.take(12).uppercase(Locale.ROOT)
+    }
+
+    private fun formatDuration(seconds: Double): String {
+        val total = seconds.toLong().coerceAtLeast(0)
+        val hours = total / 3600
+        val minutes = (total % 3600) / 60
+        val secs = total % 60
+        return if (hours > 0) "%d:%02d:%02d".format(Locale.ROOT, hours, minutes, secs)
+        else "%d:%02d".format(Locale.ROOT, minutes, secs)
+    }
+
+    private fun formatBytes(bytes: Long): String = when {
+        bytes >= 1024L * 1024L * 1024L -> "%.2f GB".format(Locale.ROOT, bytes / (1024.0 * 1024.0 * 1024.0))
+        bytes >= 1024L * 1024L -> "%.1f MB".format(Locale.ROOT, bytes / (1024.0 * 1024.0))
+        bytes >= 1024L -> "%.0f KB".format(Locale.ROOT, bytes / 1024.0)
+        else -> "$bytes B"
+    }
+
+    private fun showMediaActions(media: MediaCandidate) {
+        val blobUrl = media.url.startsWith("blob:", true)
+        val actions = mutableListOf<String>()
+        if (!blobUrl) {
+            actions += "新标签预览"
+            actions += "使用系统应用打开"
+            actions += "下载资源"
+        }
+        actions += "复制链接"
+        actions += "复制媒体信息"
+        AlertDialog.Builder(this)
+            .setTitle(mediaDisplayTitle(media))
+            .setItems(actions.toTypedArray()) { dialog, which ->
+                when (actions[which]) {
+                    "新标签预览" -> newTab(media.url)
+                    "使用系统应用打开" -> try {
+                        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(media.url)))
+                    } catch (_: Exception) {
+                        toast("没有可处理该媒体的应用")
+                    }
+                    "下载资源" -> enqueueMediaDownload(media)
+                    "复制链接" -> copyText(media.url)
+                    "复制媒体信息" -> copyText("${mediaDisplayTitle(media)}\n${mediaDisplaySubtitle(media)}\n${media.url}")
+                }
+                dialog.dismiss()
+            }
+            .show()
+    }
+
+    private fun enqueueMediaDownload(media: MediaCandidate) {
+        if (media.url.startsWith("blob:", true)) {
+            toast("Blob 临时地址不能直接下载，请寻找对应的流媒体清单")
+            return
+        }
+        try {
+            val request = DownloadManager.Request(Uri.parse(media.url))
+                .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+            if (media.mime.isNotBlank()) request.setMimeType(media.mime.substringBefore(';'))
+            val userAgent = currentWeb()?.settings?.userAgentString.orEmpty()
+            val referer = currentWeb()?.url.orEmpty()
+            val cookie = runCatching { CookieManager.getInstance().getCookie(media.url) }.getOrNull().orEmpty()
+            if (userAgent.isNotBlank()) request.addRequestHeader("User-Agent", userAgent)
+            if (referer.startsWith("http://") || referer.startsWith("https://")) {
+                request.addRequestHeader("Referer", referer)
+            }
+            if (cookie.isNotBlank()) request.addRequestHeader("Cookie", cookie)
+            val name = runCatching { Uri.parse(media.url).lastPathSegment.orEmpty() }.getOrDefault("")
+            if (name.isNotBlank()) request.setTitle(name.take(120))
+            (getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(request)
+            toast(if (media.kind == "playlist") "已下载流媒体清单" else "已加入下载队列")
+        } catch (e: Exception) {
+            toast("下载失败：${e.message}")
         }
     }
 
@@ -1697,21 +1943,41 @@ class MainActivity : AppCompatActivity() {
         val scripts = settings.getScripts()
         showBrowserSheet(
             title = "用户脚本",
-            subtitle = "${scripts.size} 个脚本 · 新标签页加载启用脚本",
-            headerActionLabel = "＋ 添加",
+            subtitle = "${scripts.size} 个脚本 · 网页中的 .user.js 安装链接可直接识别",
+            headerActionLabel = "＋ 手动",
             headerAction = { dialog ->
                 dialog.dismiss()
                 showAddScriptDialog()
             }
         ) { content, dialog ->
+            content.addView(panelRow(
+                iconRes = R.drawable.ic_link,
+                title = "从脚本链接安装",
+                subtitle = "粘贴标准 .user.js 地址；在脚本网站点击安装链接也会自动弹出确认",
+                trailingIcon = R.drawable.ic_forward,
+                onTrailing = {
+                    dialog.dismiss()
+                    showUserscriptUrlDialog()
+                },
+                onClick = {
+                    dialog.dismiss()
+                    showUserscriptUrlDialog()
+                }
+            ))
             if (scripts.isEmpty()) {
                 content.addView(emptyPanel(R.drawable.ic_extension, "暂无用户脚本", "添加脚本后可按 URL 规则自动注入页面"))
             }
             scripts.forEachIndexed { index, script ->
+                val source = if (script.sourceUrl.isNotBlank()) {
+                    displayHost(script.sourceUrl)
+                } else {
+                    script.urlPattern.lineSequence().firstOrNull().orEmpty().ifBlank { "手动脚本" }
+                }
+                val version = script.version.takeIf { it.isNotBlank() }?.let { " · v$it" }.orEmpty()
                 content.addView(panelRow(
                     iconRes = R.drawable.ic_extension,
                     title = script.name,
-                    subtitle = "${if (script.enabled) "已启用" else "已停用"} · ${script.urlPattern}",
+                    subtitle = "${if (script.enabled) "已启用" else "已停用"}$version · $source",
                     trailingIcon = R.drawable.ic_delete,
                     selected = script.enabled,
                     onTrailing = {
@@ -1720,6 +1986,7 @@ class MainActivity : AppCompatActivity() {
                         settings.saveScripts(updated)
                         toast("脚本已删除")
                         dialog.dismiss()
+                        showScriptManager()
                     },
                     onClick = {
                         val updated = settings.getScripts().toMutableList()
@@ -1729,7 +1996,259 @@ class MainActivity : AppCompatActivity() {
                             toast("脚本已${if (updated[index].enabled) "启用" else "停用"}，新标签页后生效")
                         }
                         dialog.dismiss()
+                        showScriptManager()
                     }
+                ))
+            }
+        }
+    }
+
+    private data class UserscriptMetadata(
+        val name: String,
+        val namespace: String,
+        val version: String,
+        val description: String,
+        val matches: List<String>,
+        val excludes: List<String>,
+        val grants: List<String>,
+        val requires: List<String>
+    )
+
+    private data class FetchedUserscript(val source: String, val finalUrl: String)
+
+    private fun isUserscriptUri(uri: Uri): Boolean {
+        val scheme = uri.scheme?.lowercase(Locale.ROOT)
+        if (scheme != "http" && scheme != "https") return false
+        return uri.path.orEmpty().lowercase(Locale.ROOT).endsWith(".user.js")
+    }
+
+    private fun showUserscriptUrlDialog() {
+        val input = EditText(this).apply {
+            hint = "https://example.com/script.user.js"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            setSingleLine(true)
+            setPadding(18.dp(), 8.dp(), 18.dp(), 8.dp())
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("从链接安装用户脚本")
+            .setMessage("支持 HTTP(S) 标准 UserScript；下载后会先显示元数据和权限提醒。")
+            .setView(input)
+            .setPositiveButton("读取脚本", null)
+            .setNegativeButton("取消", null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(android.content.DialogInterface.BUTTON_POSITIVE).setOnClickListener {
+                val url = input.text.toString().trim()
+                val uri = runCatching { Uri.parse(url) }.getOrNull()
+                val scheme = uri?.scheme?.lowercase(Locale.ROOT)
+                if (uri == null || (scheme != "http" && scheme != "https")) {
+                    toast("请输入有效的 HTTP(S) 脚本链接")
+                    return@setOnClickListener
+                }
+                dialog.dismiss()
+                requestUserscriptInstall(url)
+            }
+        }
+        dialog.show()
+    }
+
+    private fun requestUserscriptInstall(url: String) {
+        if (userscriptInstallBusy) {
+            toast("已有用户脚本正在读取，请稍候")
+            return
+        }
+        val uri = runCatching { Uri.parse(url) }.getOrNull()
+        val scheme = uri?.scheme?.lowercase(Locale.ROOT)
+        if (uri == null || (scheme != "http" && scheme != "https")) {
+            toast("仅支持 HTTP(S) 用户脚本链接")
+            return
+        }
+        val userAgent = currentWeb()?.settings?.userAgentString
+            ?: WebSettings.getDefaultUserAgent(this)
+        val referer = currentWeb()?.url.orEmpty()
+        val cookie = runCatching { CookieManager.getInstance().getCookie(url) }.getOrNull().orEmpty()
+        userscriptInstallBusy = true
+        toast("正在读取用户脚本…")
+        Thread {
+            val result = runCatching {
+                val fetched = fetchUserscriptSource(url, userAgent, cookie, referer)
+                val metadata = parseUserscriptMetadata(fetched.source)
+                    ?: throw IllegalArgumentException("未发现标准 ==UserScript== 元数据")
+                fetched to metadata
+            }
+            runOnUiThread {
+                userscriptInstallBusy = false
+                result.onSuccess { (fetched, metadata) ->
+                    showUserscriptInstallPreview(fetched, metadata)
+                }.onFailure { error ->
+                    toast("读取脚本失败：${error.message ?: "未知错误"}")
+                }
+            }
+        }.start()
+    }
+
+    private fun fetchUserscriptSource(
+        url: String,
+        userAgent: String,
+        cookie: String,
+        referer: String
+    ): FetchedUserscript {
+        val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 15_000
+            readTimeout = 20_000
+            instanceFollowRedirects = true
+            setRequestProperty("User-Agent", userAgent)
+            setRequestProperty("Accept", "text/javascript, application/javascript, text/plain;q=0.9, */*;q=0.5")
+            if (cookie.isNotBlank()) setRequestProperty("Cookie", cookie)
+            if (referer.startsWith("http://") || referer.startsWith("https://")) {
+                setRequestProperty("Referer", referer)
+            }
+        }
+        try {
+            val responseCode = connection.responseCode
+            if (responseCode !in 200..299) {
+                throw IllegalArgumentException("HTTP $responseCode")
+            }
+            val declaredLength = connection.contentLengthLong
+            if (declaredLength > 1_000_000L) {
+                throw IllegalArgumentException("脚本文件超过 1 MB 安全上限")
+            }
+            val output = ByteArrayOutputStream()
+            connection.inputStream.use { input ->
+                val buffer = ByteArray(8192)
+                var total = 0
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read < 0) break
+                    total += read
+                    if (total > 1_000_000) {
+                        throw IllegalArgumentException("脚本文件超过 1 MB 安全上限")
+                    }
+                    output.write(buffer, 0, read)
+                }
+            }
+            val source = output.toString(Charsets.UTF_8.name()).removePrefix("\uFEFF")
+            if (source.length > 200_000) {
+                throw IllegalArgumentException("脚本代码超过 200,000 字符上限")
+            }
+            return FetchedUserscript(source, connection.url.toString())
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun parseUserscriptMetadata(source: String): UserscriptMetadata? {
+        val start = source.indexOf("==UserScript==")
+        val end = source.indexOf("==/UserScript==", start.coerceAtLeast(0))
+        if (start < 0 || end <= start) return null
+        val block = source.substring(start, end)
+        val fields = LinkedHashMap<String, MutableList<String>>()
+        Regex("""(?m)^\s*//\s*@([A-Za-z0-9:_-]+)\s*(.*?)\s*$""").findAll(block).forEach { match ->
+            val key = match.groupValues[1].lowercase(Locale.ROOT)
+            val value = match.groupValues[2].trim()
+            fields.getOrPut(key) { mutableListOf() }.add(value)
+        }
+        fun first(vararg keys: String): String {
+            keys.forEach { key ->
+                fields[key]?.firstOrNull { it.isNotBlank() }?.let { return it }
+            }
+            return ""
+        }
+        val name = first("name:zh-cn", "name:zh", "name")
+        if (name.isBlank()) return null
+        val matches = ((fields["match"] ?: emptyList()) + (fields["include"] ?: emptyList()))
+            .filter { it.isNotBlank() }.distinct().take(40)
+        val excludes = ((fields["exclude-match"] ?: emptyList()) + (fields["exclude"] ?: emptyList()))
+            .filter { it.isNotBlank() }.distinct().take(40)
+        return UserscriptMetadata(
+            name = name.take(120),
+            namespace = first("namespace").take(200),
+            version = first("version").take(80),
+            description = first("description:zh-cn", "description:zh", "description").take(500),
+            matches = matches.ifEmpty { listOf("*") },
+            excludes = excludes,
+            grants = (fields["grant"] ?: emptyList()).filter { it.isNotBlank() }.distinct(),
+            requires = (fields["require"] ?: emptyList()).filter { it.isNotBlank() }.distinct()
+        )
+    }
+
+    private fun showUserscriptInstallPreview(
+        fetched: FetchedUserscript,
+        metadata: UserscriptMetadata
+    ) {
+        val scripts = settings.getScripts().toMutableList()
+        val existingIndex = scripts.indexOfFirst { installed ->
+            (installed.sourceUrl.isNotBlank() && installed.sourceUrl == fetched.finalUrl) ||
+                (metadata.namespace.isNotBlank() &&
+                    installed.namespace == metadata.namespace &&
+                    installed.name == metadata.name)
+        }
+        val updating = existingIndex >= 0
+        val scopeText = metadata.matches.take(3).joinToString(" · ").let {
+            if (metadata.matches.size > 3) "$it · +${metadata.matches.size - 3}" else it
+        }
+        showBrowserSheet(
+            title = if (updating) "更新用户脚本" else "安装用户脚本",
+            subtitle = displayHost(fetched.finalUrl),
+            headerActionLabel = if (updating) "更新" else "安装",
+            headerAction = { dialog ->
+                val previous = scripts.getOrNull(existingIndex)
+                val installed = Userscript(
+                    id = previous?.id ?: "us_${System.currentTimeMillis()}",
+                    name = metadata.name,
+                    enabled = previous?.enabled ?: true,
+                    urlPattern = metadata.matches.joinToString("\n"),
+                    code = fetched.source,
+                    excludePattern = metadata.excludes.joinToString("\n"),
+                    sourceUrl = fetched.finalUrl,
+                    namespace = metadata.namespace,
+                    version = metadata.version,
+                    description = metadata.description
+                )
+                if (existingIndex >= 0) {
+                    scripts[existingIndex] = installed
+                } else {
+                    scripts.add(0, installed)
+                }
+                settings.saveScripts(scripts)
+                toast(if (updating) "用户脚本已更新，新标签页后生效" else "用户脚本已安装，新标签页后生效")
+                dialog.dismiss()
+                showScriptManager()
+            }
+        ) { content, _ ->
+            content.addView(panelRow(
+                R.drawable.ic_extension,
+                metadata.name,
+                listOfNotNull(
+                    metadata.version.takeIf { it.isNotBlank() }?.let { "版本 $it" },
+                    metadata.namespace.takeIf { it.isNotBlank() }
+                ).joinToString(" · ").ifBlank { "标准 UserScript" }
+            ))
+            if (metadata.description.isNotBlank()) {
+                content.addView(panelRow(R.drawable.ic_info, "说明", metadata.description))
+            }
+            content.addView(panelRow(
+                R.drawable.ic_link,
+                "运行范围",
+                "$scopeText${if (metadata.excludes.isNotEmpty()) " · 排除 ${metadata.excludes.size} 条" else ""}"
+            ))
+            content.addView(panelRow(
+                R.drawable.ic_shield,
+                "安装前确认来源",
+                "脚本将在匹配网页中执行；仅安装你信任的来源。"
+            ))
+            if (fetched.finalUrl.startsWith("http://", true)) {
+                content.addView(panelRow(
+                    R.drawable.ic_shield,
+                    "非 HTTPS 来源",
+                    "该脚本通过明文 HTTP 下载，内容可能在传输途中被修改；建议优先使用 HTTPS 安装地址。"
+                ))
+            }
+            if (metadata.requires.isNotEmpty() || metadata.grants.any { it.lowercase(Locale.ROOT) != "none" }) {
+                content.addView(panelRow(
+                    R.drawable.ic_info,
+                    "兼容性提示",
+                    "检测到 ${metadata.grants.size} 个 @grant / ${metadata.requires.size} 个 @require；部分 Tampermonkey 专用 API 或外部依赖可能需要后续兼容。"
                 ))
             }
         }
@@ -1788,6 +2307,7 @@ class MainActivity : AppCompatActivity() {
                 settings.saveScripts(list)
                 toast("脚本已添加，新标签页或下次启动后生效")
                 dialog.dismiss()
+                showScriptManager()
             }
         }
         dialog.show()
@@ -1899,17 +2419,91 @@ class MainActivity : AppCompatActivity() {
         return false
     }
 
+    private fun scriptPatternList(value: String): List<String> =
+        value.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.distinct().toList()
+
+    /**
+     * WebView document-start API 只能按 origin 限制，先尽量收窄域名；
+     * 具体路径、@include 与 @exclude 再由运行时 wrapper 精确判断。
+     */
     private fun patternToOriginRules(pattern: String): Set<String> {
-        val p = pattern.trim()
-        if (p.isEmpty() || p == "*") return setOf("*")
-        val host = p.trim('*').trim().lowercase()
-            .removePrefix("https://").removePrefix("http://").trim('/')
-        if (host.isEmpty()) return setOf("*")
-        return buildSet {
-            add("https://$host")
-            add("http://$host")
-            add("https://*.$host")
-            add("http://*.$host")
+        val patterns = scriptPatternList(pattern)
+        if (patterns.isEmpty() || patterns.any { it == "*" || it == "<all_urls>" }) return setOf("*")
+        val origins = linkedSetOf<String>()
+        for (raw in patterns) {
+            if (raw.startsWith("/") && raw.endsWith("/")) return setOf("*")
+            val marker = raw.indexOf("://")
+            if (marker > 0) {
+                val schemeToken = raw.substring(0, marker).lowercase(Locale.ROOT)
+                val authority = raw.substring(marker + 3).substringBefore('/').substringBefore('?').substringBefore('#')
+                if (authority.isBlank() || authority == "*") return setOf("*")
+                val schemes = when (schemeToken) {
+                    "*" -> listOf("http", "https")
+                    "http", "https" -> listOf(schemeToken)
+                    else -> emptyList()
+                }
+                if (schemes.isEmpty()) continue
+                val host = authority.substringBefore(':').lowercase(Locale.ROOT)
+                if (host.isBlank() || host == "*") return setOf("*")
+                schemes.forEach { scheme -> origins.add("$scheme://$host") }
+                continue
+            }
+
+            val host = Regex("""([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)""")
+                .find(raw)?.value?.lowercase(Locale.ROOT)
+                ?: return setOf("*")
+            origins.add("https://$host")
+            origins.add("http://$host")
+            origins.add("https://*.$host")
+            origins.add("http://*.$host")
+        }
+        return if (origins.isEmpty()) setOf("*") else origins
+    }
+
+    private fun wrapUserscriptForRuntime(script: Userscript): String {
+        val includes = JSONArray(scriptPatternList(script.urlPattern).ifEmpty { listOf("*") }).toString()
+        val excludes = JSONArray(scriptPatternList(script.excludePattern)).toString()
+        val label = JSONObject.quote(script.name)
+        return buildString {
+            append(
+                """
+                (function(){
+                  var __bdIncludes = $includes;
+                  var __bdExcludes = $excludes;
+                  function __bdMatch(pattern, url) {
+                    if (!pattern || pattern === '*' || pattern === '<all_urls>') return true;
+                    if (pattern.length > 2 && pattern.charAt(0) === '/' && pattern.charAt(pattern.length - 1) === '/') {
+                      try { return new RegExp(pattern.slice(1, -1)).test(url); } catch (_) { return false; }
+                    }
+                    var special = "\\.^+?()[]{}|" + String.fromCharCode(36);
+                    var re = '';
+                    for (var i = 0; i < pattern.length; i++) {
+                      var ch = pattern.charAt(i);
+                      if (ch === '*') re += '.*';
+                      else {
+                        if (special.indexOf(ch) >= 0) re += '\\';
+                        re += ch;
+                      }
+                    }
+                    try { return new RegExp('^' + re + String.fromCharCode(36)).test(url); } catch (_) { return false; }
+                  }
+                  var __bdUrl = String(location.href);
+                  if (!__bdIncludes.some(function(p){ return __bdMatch(p, __bdUrl); })) return;
+                  if (__bdExcludes.some(function(p){ return __bdMatch(p, __bdUrl); })) return;
+                  try {
+                """.trimIndent()
+            )
+            append('\n')
+            append(script.code)
+            append('\n')
+            append(
+                """
+                  } catch (e) {
+                    console.error('[BrowserDiag UserScript]', $label, e);
+                  }
+                })();
+                """.trimIndent()
+            )
         }
     }
 
@@ -2304,19 +2898,163 @@ class MainActivity : AppCompatActivity() {
             "revcontent.com", "popads.net", "propellerads.com", "adsterra.com"
         )
 
+        private val MEDIA_SNIFF_JS = """
+            (function(){
+              var map = Object.create(null);
+              var priority = {playlist:5, video:4, audio:4, media:3, segment:1};
+              function absoluteUrl(value) {
+                if (!value) return '';
+                var raw = String(value);
+                if (raw.indexOf('data:') === 0) return '';
+                try { return new URL(raw, document.baseURI).href; } catch (_) { return raw; }
+              }
+              function extensionOf(url) {
+                var clean = String(url).split('#')[0].split('?')[0].toLowerCase();
+                var index = clean.lastIndexOf('.');
+                return index >= 0 ? clean.slice(index + 1) : '';
+              }
+              function guessKind(url, mime, initiator) {
+                var ext = extensionOf(url);
+                var type = String(mime || '').toLowerCase();
+                var init = String(initiator || '').toLowerCase();
+                var decoded = String(url || '').toLowerCase();
+                try { decoded = decodeURIComponent(decoded); } catch (_) {}
+                if (ext === 'm3u8' || ext === 'mpd' || type.indexOf('mpegurl') >= 0 || type.indexOf('dash+xml') >= 0) return 'playlist';
+                if (ext === 'ts' || ext === 'm2ts' || ext === 'm4s' || ext === 'cmfv' || ext === 'cmfa') return 'segment';
+                if (['mp4','webm','mkv','mov','m4v','flv','3gp','ogv','mpeg','mpg'].indexOf(ext) >= 0 || type.indexOf('video/') === 0) return 'video';
+                if (['mp3','m4a','aac','ogg','oga','opus','wav','flac'].indexOf(ext) >= 0 || type.indexOf('audio/') === 0) return 'audio';
+                if (decoded.indexOf('mime=video/') >= 0 || decoded.indexOf('type=video/') >= 0) return 'video';
+                if (decoded.indexOf('mime=audio/') >= 0 || decoded.indexOf('type=audio/') >= 0) return 'audio';
+                if (decoded.indexOf('m3u8') >= 0 || decoded.indexOf('application/dash+xml') >= 0) return 'playlist';
+                if (init === 'video') return 'video';
+                if (init === 'audio') return 'audio';
+                if (init === 'media') return 'media';
+                return '';
+              }
+              function add(url, source, kind, mime, bytes, duration, width, height, status) {
+                var resolved = absoluteUrl(url);
+                if (!resolved) return;
+                var detected = kind || guessKind(resolved, mime, '');
+                if (!detected) return;
+                var item = map[resolved];
+                if (!item) {
+                  item = map[resolved] = {
+                    url: resolved,
+                    kind: detected,
+                    source: source || '',
+                    mime: mime || '',
+                    bytes: Number(bytes) || 0,
+                    duration: Number(duration) || 0,
+                    width: Number(width) || 0,
+                    height: Number(height) || 0,
+                    status: Number(status) || 0
+                  };
+                  return;
+                }
+                if ((priority[detected] || 0) > (priority[item.kind] || 0)) item.kind = detected;
+                if (source && item.source.split(' · ').indexOf(source) < 0) item.source += (item.source ? ' · ' : '') + source;
+                if (!item.mime && mime) item.mime = mime;
+                item.bytes = Math.max(item.bytes || 0, Number(bytes) || 0);
+                item.duration = Math.max(item.duration || 0, Number(duration) || 0);
+                item.width = Math.max(item.width || 0, Number(width) || 0);
+                item.height = Math.max(item.height || 0, Number(height) || 0);
+                if (!item.status && status) item.status = Number(status) || 0;
+              }
+
+              document.querySelectorAll('video,audio').forEach(function(media){
+                var tag = media.tagName.toLowerCase();
+                var kind = tag === 'audio' ? 'audio' : 'video';
+                add(
+                  media.currentSrc || media.src,
+                  '页面 ' + tag,
+                  kind,
+                  media.getAttribute('type') || '',
+                  0,
+                  media.duration,
+                  media.videoWidth,
+                  media.videoHeight,
+                  0
+                );
+                media.querySelectorAll('source').forEach(function(source){
+                  add(source.src, 'source 标签', kind, source.type || '', 0, media.duration, media.videoWidth, media.videoHeight, 0);
+                });
+              });
+
+              try {
+                performance.getEntriesByType('resource').forEach(function(entry){
+                  var kind = guessKind(entry.name, '', entry.initiatorType);
+                  if (kind) {
+                    add(
+                      entry.name,
+                      'Performance ' + (entry.initiatorType || 'resource'),
+                      kind,
+                      '',
+                      entry.encodedBodySize || entry.transferSize || 0,
+                      0,
+                      0,
+                      0,
+                      0
+                    );
+                  }
+                });
+              } catch (_) {}
+
+              (window.__bdNet || []).forEach(function(entry){
+                var kind = guessKind(entry.url, entry.mime, entry.type);
+                if (kind) {
+                  add(
+                    entry.url,
+                    String(entry.type || 'network').toUpperCase(),
+                    kind,
+                    entry.mime || '',
+                    entry.bytes || 0,
+                    0,
+                    0,
+                    0,
+                    entry.status || 0
+                  );
+                }
+              });
+
+              var out = Object.keys(map).map(function(key){ return map[key]; });
+              out.sort(function(a,b){ return (priority[b.kind] || 0) - (priority[a.kind] || 0); });
+              return JSON.stringify(out.slice(0, 160));
+            })()
+        """.trimIndent()
+
         private val NETWORK_HOOK_JS = """
             (function(){
               if (window.__bdHooked) return;
               window.__bdHooked = true;
               window.__bdNet = [];
-              function record(u,m,s,t){ window.__bdNet.push({url:String(u).slice(0,300),method:m,status:s,type:t}); if(window.__bdNet.length>300) window.__bdNet.shift(); }
+              function record(u,m,s,t,mime,bytes){
+                window.__bdNet.push({
+                  url:String(u).slice(0,4096),
+                  method:m,
+                  status:s,
+                  type:t,
+                  mime:String(mime || '').slice(0,160),
+                  bytes:Number(bytes) || 0,
+                  ts:Date.now()
+                });
+                if(window.__bdNet.length>300) window.__bdNet.shift();
+              }
               function urlOf(u){ if(typeof u==='string')return u;if(u&&u.url)return u.url;if(u&&u.href)return u.href;return String(u); }
               var op = XMLHttpRequest.prototype.open;
               var sp = XMLHttpRequest.prototype.send;
               XMLHttpRequest.prototype.open = function(m,u){ this.__u=u; this.__m=m; return op.apply(this,arguments); };
               XMLHttpRequest.prototype.send = function(){
-                this.addEventListener('load', function(){ record(this.__u,this.__m,this.status,'xhr'); });
-                this.addEventListener('error', function(){ record(this.__u,this.__m,0,'xhr'); });
+                this.addEventListener('load', function(){
+                  record(
+                    this.responseURL || this.__u,
+                    this.__m,
+                    this.status,
+                    'xhr',
+                    this.getResponseHeader('content-type') || '',
+                    this.getResponseHeader('content-length') || 0
+                  );
+                });
+                this.addEventListener('error', function(){ record(this.__u,this.__m,0,'xhr','',''); });
                 return sp.apply(this,arguments);
               };
               var of = window.fetch;
@@ -2324,8 +3062,17 @@ class MainActivity : AppCompatActivity() {
                 var u = arguments[0];
                 var init = arguments[1] || {};
                 var method = String(init.method || (u && u.method) || 'GET').toUpperCase();
-                return of.apply(this,arguments).then(function(r){ record(urlOf(u),method,r.status,'fetch'); return r; })
-                  .catch(function(e){ record(urlOf(u),method,0,'fetch'); throw e; });
+                return of.apply(this,arguments).then(function(r){
+                  record(
+                    r.url || urlOf(u),
+                    method,
+                    r.status,
+                    'fetch',
+                    r.headers.get('content-type') || '',
+                    r.headers.get('content-length') || 0
+                  );
+                  return r;
+                }).catch(function(e){ record(urlOf(u),method,0,'fetch','',''); throw e; });
               };
             })();
         """.trimIndent()
