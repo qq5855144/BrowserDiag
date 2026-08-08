@@ -6,17 +6,19 @@ on:
     paths:
       - 'android/**'
       - 'mcp-server/**'
+      - '.skills/**'
       - '.github/workflows/build-apk.yml'
   pull_request:
     branches: [main]
     paths:
       - 'android/**'
       - 'mcp-server/**'
+      - '.skills/**'
       - '.github/workflows/build-apk.yml'
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   node-quality:
@@ -60,8 +62,25 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
 
+      - name: Decode release signing keystore
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p ../keystore
+          echo "${{ secrets.BROWSERDIAG_KEYSTORE_B64 }}" | base64 -d > ../keystore/browserdiag-release.keystore
+          ls -la ../keystore/
+
       - name: Lint, test, and build APKs
+        env:
+          BROWSERDIAG_STORE_PASSWORD: ${{ secrets.BROWSERDIAG_STORE_PASSWORD }}
+          BROWSERDIAG_KEY_ALIAS: ${{ secrets.BROWSERDIAG_KEY_ALIAS }}
+          BROWSERDIAG_KEY_PASSWORD: ${{ secrets.BROWSERDIAG_KEY_PASSWORD }}
         run: ./gradlew lintDebug testDebugUnitTest assembleDebug assembleRelease --no-daemon
+
+      - name: Verify release APK signature
+        if: github.event_name != 'pull_request'
+        run: |
+          apksigner=$(ls "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | tail -1)
+          "$apksigner" verify --print-certs app/build/outputs/apk/release/*-release.apk
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
@@ -76,3 +95,27 @@ jobs:
           name: browserdiag-release-apk
           path: android/app/build/outputs/apk/release/*.apk
           retention-days: 7
+
+      - name: Publish signed release to GitHub Releases
+        if: github.event_name != 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          VERSION=$(grep -oP 'versionName\s*=\s*"\K[^"]+' android/app/build.gradle.kts)
+          TAG="v${VERSION}"
+          APK=$(ls android/app/build/outputs/apk/release/*-release.apk | head -1)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, uploading new artifact..."
+            gh release upload "$TAG" "$APK" --clobber
+          else
+            echo "Creating release $TAG ..."
+            gh release create "$TAG" "$APK" \
+              --title "BrowserDiag ${VERSION}" \
+              --notes "Automated signed release build (commit ${GITHUB_SHA:0:7}).
+
+- 由 GitHub Actions 自动构建并签名（BROWSERDIAG release keystore）
+- 安装前请先卸载旧版本（包名 com.browserdiag.app 相同）
+- 支持 MCP stdio / CLI / HTTP 三种模式，Android 内置 WebView 浏览器诊断 + 28 个 MCP 工具"
+          fi
+          gh release view "$TAG" --json tagName,name,assets --jq '.tagName + " | " + .name + " | assets: " + ([.assets[].name] | join(","))'

@@ -208,6 +208,20 @@ curl -s -X POST http://PHONE_IP:8788/api/browser_open \
 - 不要把 `BROWSERDIAG_TOKEN` 写入仓库；`.env` 已加入忽略规则。
 - WebView 远程调试默认关闭，只在用户显式开启时生效。
 
+## Operit 技能包安装
+
+本仓库同时发布 Operit（AI 助手）可安装的 MCP 技能包，AI 可通过仓库链接识别并安装：
+
+- **技能定义**：`.skills/browserdiag/SKILL.md`（frontmatter `name: BrowserDiag` + 能力/安装/用法说明）。
+- **MCP 插件入口**：`mcp-server/` 目录（含 `package.json`、`server.js`、`README.md`、`mcp.config.json` 标志文件），`mcp.config.json` 提供可直接合并进 `/sdcard/Download/Operit/mcp_plugins/mcp_config.json` 的 `mcpServers.browserdiag` 注册模板。
+
+安装步骤（Operit AI 按 `.skills/browserdiag/SKILL.md` 指引执行）：
+
+1. 下载本仓库 zip 或 `git clone https://github.com/qq5855144/BrowserDiag.git`。
+2. 将 `mcp-server/` 复制到 `/sdcard/Download/Operit/mcp_plugins/browserdiag/`，并将 `mcp.config.json` 中 `mcpServers.browserdiag` 合并进 `mcp_config.json`；系统会在 Linux 侧 `~/mcp_plugins/browserdiag/` 部署并自动安装依赖、以 `node server.js` 启动。
+3. 将 `.skills/browserdiag/` 复制到 `/sdcard/Download/Operit/skills/browserdiag/`。
+4. 验证：`use_package` / `ping_mcp` 探测 `browserdiag`，随后即可调用 `browser_open` 等 28 个工具。
+
 ## 质量检查
 
 ```bash
