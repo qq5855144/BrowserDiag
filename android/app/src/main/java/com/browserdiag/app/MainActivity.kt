@@ -81,7 +81,7 @@ import java.util.Locale
 import java.util.WeakHashMap
 
 /**
- * BrowserDiag 3.4：Chrome 风格底部导航浏览器 + MCP HTTP Bridge + 网络实验室。
+ * BrowserDiag 3.5：Chrome 风格底部导航浏览器 + 原生 MCP Streamable HTTP + 网络实验室。
  * 功能：多标签 / 搜索引擎切换 / UA 切换 / 深色主题 / 油猴脚本 / 书签 / 保存页面 / 分享 /
  * 页面查找 / 翻译 / 媒体嗅探 / 页面资源 / 源码 zip / 语音播报 / 二维码 / 添加到桌面 / 历史。
  * 平时可作普通浏览器使用，也可作为诊断后端供其它 AI 工具通过 HTTP 调用。
@@ -1353,9 +1353,15 @@ class MainActivity : AppCompatActivity() {
             R.drawable.ic_info,
             if (settings.lanApiEnabled) "MCP 接口已允许局域网访问" else "MCP 接口仅限本机",
             listOf(
-                MenuItem("lanapi", R.drawable.ic_link, "局域网 MCP 接口", if (settings.lanApiEnabled) "已开启 · HTTP Bridge · Token 认证" else "已关闭 · 仅本机") { toggleLanApi() },
+                MenuItem("lanapi", R.drawable.ic_link, "局域网 MCP 接口", if (settings.lanApiEnabled) "已开启 · Streamable HTTP · Token 认证" else "已关闭 · 仅本机") { toggleLanApi() },
+                MenuItem(
+                    "mcpcompat",
+                    R.drawable.ic_shield,
+                    "MCP URL-only 兼容",
+                    if (settings.mcpUrlOnlyCompatibility) "已开启 · 仅限可信局域网" else "已关闭 · 推荐 Token 模式"
+                ) { toggleMcpUrlOnlyCompatibility() },
                 MenuItem("menuconfig", R.drawable.ic_settings, "常用工具设置", "选择工具中心的常用快捷入口") { showMenuConfig() },
-                MenuItem("about", R.drawable.ic_info, "关于 BrowserDiag", "v3.4.0 · MCP ${serverPort}") { showAbout() }
+                MenuItem("about", R.drawable.ic_info, "关于 BrowserDiag", "v3.5.0 · MCP ${serverPort}") { showAbout() }
             )
         )
     )
@@ -2147,6 +2153,7 @@ class MainActivity : AppCompatActivity() {
     // ==================== 开发者工具 ====================
     private fun devTools() {
         val api = apiBaseUrl()
+        val mcp = mcpEndpointUrl()
         val token = settings.apiToken
         val wv = currentWeb()
         val errors = synchronized(consoleLogs) { consoleLogs.count { it.optString("type") == "error" } }
@@ -2154,15 +2161,35 @@ class MainActivity : AppCompatActivity() {
             content.addView(sectionTitle("连接"))
             content.addView(panelRow(
                 R.drawable.ic_network,
-                "MCP 接口",
-                "$api · HTTP Bridge · ${if (settings.lanApiEnabled) "局域网 + 本机" else "仅本机"}",
-                onClick = { copyText(api) }
+                "MCP Streamable HTTP",
+                "$mcp · 根地址同样兼容 · ${if (settings.lanApiEnabled) "局域网 + 本机" else "仅本机"}",
+                onClick = { copyText(mcp) }
             ))
             content.addView(panelRow(
                 R.drawable.ic_lock,
                 "MCP Token",
-                "${token.take(6)}…${token.takeLast(4)} · 点击复制完整 Token",
+                "${token.take(6)}…${token.takeLast(4)} · 推荐 Authorization: Bearer · 点击复制",
                 onClick = { copyText(token) }
+            ))
+            content.addView(panelRow(
+                R.drawable.ic_shield,
+                "只填写 URL 的客户端",
+                if (settings.mcpUrlOnlyCompatibility) {
+                    "兼容模式已开启：无需 Token 即可连接 MCP · 点击关闭"
+                } else {
+                    "默认要求 Token；若客户端不能配置 Header，可点击开启可信局域网兼容"
+                },
+                selected = settings.mcpUrlOnlyCompatibility,
+                onClick = {
+                    dialog.dismiss()
+                    toggleMcpUrlOnlyCompatibility()
+                }
+            ))
+            content.addView(panelRow(
+                R.drawable.ic_link,
+                "兼容 HTTP Bridge",
+                "$api/api/browser_* · 保留给旧集成使用 · 始终要求 Token",
+                onClick = { copyText("$api/api/") }
             ))
             content.addView(sectionTitle("当前页面"))
             content.addView(panelRow(
@@ -2189,7 +2216,7 @@ class MainActivity : AppCompatActivity() {
                 }
             ))
             content.addView(TextView(this).apply {
-                text = "此处是供 MCP / AI 工具调用的 HTTP Bridge，并非原生 MCP transport。调用必须携带 Authorization: Bearer <token>，支持页面状态、Console、Network、Eval、截图、性能、报告与源码等能力。"
+                text = "这里现在是真正的 MCP Streamable HTTP 服务：支持 2026-07-28 server/discover，并兼容 2025.x initialize/initialized、tools/list、tools/call。推荐使用 Bearer Token；URL-only 模式会把高权限浏览器控制开放给同一局域网设备，仅在可信网络使用。"
                 textSize = 12.5f
                 setTextColor(secondaryTextColor())
                 setPadding(14.dp(), 16.dp(), 14.dp(), 8.dp())
@@ -2723,10 +2750,10 @@ class MainActivity : AppCompatActivity() {
         val api = apiBaseUrl()
         val token = settings.apiToken
         val ua = currentWeb()?.settings?.userAgentString ?: ""
-        showBrowserSheet("BrowserDiag", "安全浏览 + 页面诊断 · v3.4.0") { content, _ ->
-            content.addView(panelRow(R.drawable.ic_info, "BrowserDiag 3.4.0", "Android 浏览器、网络实验室与诊断后端"))
-            content.addView(panelRow(R.drawable.ic_network, "MCP 接口", "$api · HTTP Bridge · Token 认证", onClick = {
-                copyText(api)
+        showBrowserSheet("BrowserDiag", "安全浏览 + 页面诊断 · v3.5.0") { content, _ ->
+            content.addView(panelRow(R.drawable.ic_info, "BrowserDiag 3.5.0", "Android 浏览器、网络实验室与原生 MCP 服务"))
+            content.addView(panelRow(R.drawable.ic_network, "MCP Streamable HTTP", "${mcpEndpointUrl()} · Token 认证", onClick = {
+                copyText(mcpEndpointUrl())
             }))
             content.addView(panelRow(R.drawable.ic_lock, "MCP Token", "${token.take(6)}…${token.takeLast(4)} · 点击复制", onClick = {
                 copyText(token)
@@ -3574,14 +3601,38 @@ class MainActivity : AppCompatActivity() {
         toast(if (settings.debugWeb) "已开启 WebView 远程调试（chrome://inspect 可连接）" else "已关闭远程调试")
     }
 
-    /** MCP 调用 HTTP Bridge 默认仅本机访问；显式开启后才监听局域网地址，仍必须携带 Token。 */
+    /** MCP 默认仅本机访问；显式开启后才监听局域网地址，默认仍要求 Token。 */
     private fun toggleLanApi() {
         settings.lanApiEnabled = !settings.lanApiEnabled
+        if (!settings.lanApiEnabled) settings.mcpUrlOnlyCompatibility = false
         restartServer()
         toast(
-            if (settings.lanApiEnabled) "局域网 MCP 接口已开启（HTTP Bridge · Token 认证）"
+            if (settings.lanApiEnabled) "局域网 MCP 已开启（Streamable HTTP · 默认 Token 认证）"
             else "局域网 MCP 接口已关闭，仅本机可访问"
         )
+    }
+
+    private fun toggleMcpUrlOnlyCompatibility() {
+        if (!settings.lanApiEnabled) {
+            toast("请先开启“局域网 MCP 接口”")
+            return
+        }
+        if (settings.mcpUrlOnlyCompatibility) {
+            settings.mcpUrlOnlyCompatibility = false
+            toast("URL-only 兼容已关闭；MCP 恢复 Token 认证")
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("开启 URL-only MCP 兼容？")
+            .setMessage(
+                "开启后，只需要服务器 URL 的 AI 客户端即可连接，但同一局域网中的其它设备也可能调用 BrowserDiag 的页面控制、JavaScript 执行和网络改写能力。\n\n仅在你信任的家庭/开发网络中开启；公共 Wi-Fi 请保持关闭。"
+            )
+            .setNegativeButton("取消", null)
+            .setPositiveButton("仅在可信网络开启") { _, _ ->
+                settings.mcpUrlOnlyCompatibility = true
+                toast("URL-only MCP 兼容已开启")
+            }
+            .show()
     }
 
     /** 字体大小调节（50%-200%，textZoom 持久化） */
@@ -3765,6 +3816,8 @@ class MainActivity : AppCompatActivity() {
         val host = if (settings.lanApiEnabled) localIp() else "127.0.0.1"
         return "http://$host:$serverPort"
     }
+
+    private fun mcpEndpointUrl(): String = "${apiBaseUrl()}/mcp"
 
     private fun localIp(): String {
         return try {

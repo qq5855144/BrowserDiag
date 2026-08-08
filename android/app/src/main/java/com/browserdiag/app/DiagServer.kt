@@ -20,11 +20,11 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 /**
- * Android 内嵌 MCP 调用 HTTP Bridge。
- * 默认仅监听 loopback；所有操作均要求调用方提供随机 MCP Token。
+ * Android 内嵌 MCP Streamable HTTP 服务 + 兼容 HTTP Bridge。
+ * 默认仅监听 loopback；远程连接默认要求随机 MCP Token。
  */
 class DiagServer(
-    listenHost: String,
+    private val listenHost: String,
     port: Int,
     private val context: Context,
     private val getWebView: () -> WebView?,
@@ -37,11 +37,16 @@ class DiagServer(
 ) : NanoHTTPD(listenHost, port) {
 
     override fun serve(session: IHTTPSession): Response {
+        val mcpEndpoint = isMcpEndpoint(session.uri)
         if (session.method == Method.OPTIONS) {
+            if (mcpEndpoint && !isTrustedMcpOrigin(session)) {
+                return mcpErrorResponse(session, Response.Status.FORBIDDEN, -32000, "Origin not allowed")
+            }
             val r = newFixedLengthResponse(Response.Status.NO_CONTENT, "text/plain", "")
-            addCorsHeaders(r)
+            if (mcpEndpoint) addMcpHeaders(r, session) else addCorsHeaders(r)
             return r
         }
+        if (mcpEndpoint) return serveMcp(session)
         if (!isAuthorized(session)) {
             return jsonResponse(
                 Response.Status.UNAUTHORIZED,
@@ -71,31 +76,7 @@ class DiagServer(
                 JSONObject().put("error", e.message ?: "invalid request")
             )
         }
-        val result = try {
-            when (tool) {
-                "browser_state" -> state()
-                "browser_console" -> console(params)
-                "browser_network" -> network()
-                "browser_eval" -> eval(params)
-                "browser_open" -> open(params)
-                "browser_screenshot" -> screenshot()
-                "browser_perf" -> perf()
-                "browser_report" -> report()
-                "browser_source" -> source()
-                "browser_tabs" -> tabs()
-                "browser_text" -> text()
-                "browser_interactive" -> interactive()
-                "browser_history" -> history(params)
-                "browser_bookmarks" -> bookmarks(params)
-                "browser_http" -> httpRequest(params)
-                "browser_netlog" -> netlog()
-                "browser_network_rules" -> networkRuleTool(params)
-                "browser_close" -> close()
-                else -> JSONObject().put("error", "unknown tool: $tool")
-            }
-        } catch (e: Exception) {
-            JSONObject().put("error", e.message ?: e.toString())
-        }
+        val result = executeTool(tool, params)
         return jsonResponse(Response.Status.OK, result)
     }
 
@@ -106,6 +87,384 @@ class DiagServer(
         "browser_history", "browser_bookmarks", "browser_http", "browser_netlog",
         "browser_network_rules", "browser_close"
     )
+
+    private fun executeTool(tool: String, params: JSONObject): JSONObject = try {
+        when (tool) {
+            "browser_state" -> state()
+            "browser_console" -> console(params)
+            "browser_network" -> network()
+            "browser_eval" -> eval(params)
+            "browser_open" -> open(params)
+            "browser_screenshot" -> screenshot()
+            "browser_perf" -> perf()
+            "browser_report" -> report()
+            "browser_source" -> source()
+            "browser_tabs" -> tabs()
+            "browser_text" -> text()
+            "browser_interactive" -> interactive()
+            "browser_history" -> history(params)
+            "browser_bookmarks" -> bookmarks(params)
+            "browser_http" -> httpRequest(params)
+            "browser_netlog" -> netlog()
+            "browser_network_rules" -> networkRuleTool(params)
+            "browser_close" -> close()
+            else -> JSONObject().put("error", "unknown tool: $tool")
+        }
+    } catch (e: Exception) {
+        JSONObject().put("error", e.message ?: e.toString())
+    }
+
+    // ==================== Native MCP Streamable HTTP ====================
+
+    private fun isMcpEndpoint(uri: String): Boolean {
+        val path = uri.substringBefore('?').trimEnd('/')
+        return path.isEmpty() || path == "/mcp"
+    }
+
+    private fun serveMcp(session: IHTTPSession): Response {
+        if (!isTrustedMcpOrigin(session)) {
+            return mcpErrorResponse(session, Response.Status.FORBIDDEN, -32000, "Origin not allowed")
+        }
+        if (!isMcpAuthorized(session)) {
+            return mcpErrorResponse(session, Response.Status.UNAUTHORIZED, -32001, "MCP authentication required").apply {
+                addHeader("WWW-Authenticate", "Bearer realm=\"BrowserDiag MCP\"")
+            }
+        }
+        if (session.method == Method.GET) {
+            return mcpErrorResponse(
+                session,
+                Response.Status.METHOD_NOT_ALLOWED,
+                -32000,
+                "This MCP endpoint uses request-scoped Streamable HTTP; send JSON-RPC with POST"
+            ).apply { addHeader("Allow", "POST, OPTIONS") }
+        }
+        if (session.method != Method.POST) {
+            return mcpErrorResponse(session, Response.Status.METHOD_NOT_ALLOWED, -32000, "MCP endpoint accepts POST").apply {
+                addHeader("Allow", "POST, OPTIONS")
+            }
+        }
+
+        val payload = try {
+            parseMcpPayload(session)
+        } catch (e: IllegalArgumentException) {
+            return mcpErrorResponse(session, Response.Status.BAD_REQUEST, -32700, e.message ?: "Parse error")
+        }
+
+        return when (payload) {
+            is JSONObject -> {
+                val response = handleMcpMessage(payload, session)
+                if (response == null) mcpAcceptedResponse(session)
+                else mcpJsonResponse(session, Response.Status.OK, response.toString())
+            }
+            is JSONArray -> {
+                if (payload.length() == 0) {
+                    mcpErrorResponse(session, Response.Status.BAD_REQUEST, -32600, "Invalid Request")
+                } else {
+                    val responses = JSONArray()
+                    for (index in 0 until payload.length()) {
+                        val message = payload.optJSONObject(index)
+                        if (message == null) {
+                            responses.put(jsonRpcError(JSONObject.NULL, -32600, "Invalid Request"))
+                        } else {
+                            handleMcpMessage(message, session)?.let { responses.put(it) }
+                        }
+                    }
+                    if (responses.length() == 0) mcpAcceptedResponse(session)
+                    else mcpJsonResponse(session, Response.Status.OK, responses.toString())
+                }
+            }
+            else -> mcpErrorResponse(session, Response.Status.BAD_REQUEST, -32600, "Invalid Request")
+        }
+    }
+
+    private fun parseMcpPayload(session: IHTTPSession): Any {
+        val declaredLength = header(session, "Content-Length")?.toLongOrNull()
+        if (declaredLength != null && declaredLength > MAX_REQUEST_BYTES) {
+            throw IllegalArgumentException("request body too large")
+        }
+        val files = HashMap<String, String>()
+        try {
+            session.parseBody(files)
+        } catch (e: Exception) {
+            throw IllegalArgumentException("invalid MCP request body")
+        }
+        val raw = files["postData"].orEmpty()
+        if (raw.isBlank()) throw IllegalArgumentException("empty MCP request body")
+        if (raw.toByteArray(Charsets.UTF_8).size > MAX_REQUEST_BYTES) {
+            throw IllegalArgumentException("request body too large")
+        }
+        return try {
+            JSONTokener(raw).nextValue()
+        } catch (_: Exception) {
+            throw IllegalArgumentException("invalid JSON-RPC payload")
+        }
+    }
+
+    private fun handleMcpMessage(message: JSONObject, session: IHTTPSession): JSONObject? {
+        val hasId = message.has("id")
+        val id = if (hasId) message.opt("id") ?: JSONObject.NULL else JSONObject.NULL
+        if (message.optString("jsonrpc") != "2.0") {
+            return if (hasId) jsonRpcError(id, -32600, "Invalid Request: jsonrpc must be 2.0") else null
+        }
+        val method = message.optString("method").trim()
+        if (method.isEmpty()) return if (hasId) jsonRpcError(id, -32600, "Invalid Request: method required") else null
+
+        // 2026-07-28 把路由信息镜像到 Header；有 Header 时严格核对，缺失时为旧客户端保持兼容。
+        header(session, "Mcp-Method")?.takeIf { it.isNotBlank() }?.let { routedMethod ->
+            if (routedMethod != method) return if (hasId) jsonRpcError(id, -32600, "Mcp-Method header mismatch") else null
+        }
+        if (method == "tools/call") {
+            val bodyName = message.optJSONObject("params")?.optString("name").orEmpty()
+            header(session, "Mcp-Name")?.takeIf { it.isNotBlank() }?.let { routedName ->
+                if (routedName != bodyName) return if (hasId) jsonRpcError(id, -32602, "Mcp-Name header mismatch") else null
+            }
+        }
+
+        if (!hasId) {
+            // MCP 的 initialized/cancelled 等通知无需响应；其它无 id 消息也按 JSON-RPC notification 接受。
+            return null
+        }
+        val result = when (method) {
+            "initialize" -> legacyInitializeResult(message.optJSONObject("params"))
+            "server/discover" -> discoverResult()
+            "ping" -> JSONObject()
+            "tools/list" -> listToolsResult()
+            "tools/call" -> {
+                val params = message.optJSONObject("params")
+                    ?: return jsonRpcError(id, -32602, "tools/call params must be an object")
+                val name = params.optString("name").trim()
+                if (name !in tools()) return jsonRpcError(id, -32602, "Unknown tool: $name")
+                val args = params.optJSONObject("arguments") ?: JSONObject()
+                val toolResult = executeTool(name, args)
+                JSONObject()
+                    .put("resultType", "complete")
+                    .put("content", JSONArray().put(JSONObject().put("type", "text").put("text", toolResult.toString())))
+                    .put("structuredContent", toolResult)
+                    .put("isError", toolResult.has("error"))
+            }
+            else -> return jsonRpcError(id, -32601, "Method not found: $method")
+        }
+        return JSONObject().put("jsonrpc", "2.0").put("id", id).put("result", result)
+    }
+
+    private fun legacyInitializeResult(params: JSONObject?): JSONObject {
+        val requested = params?.optString("protocolVersion").orEmpty()
+        val selected = if (requested in LEGACY_MCP_VERSIONS) requested else MCP_LEGACY_VERSION
+        return JSONObject()
+            .put("protocolVersion", selected)
+            .put("capabilities", JSONObject().put("tools", JSONObject().put("listChanged", false)))
+            .put(
+                "serverInfo",
+                JSONObject()
+                    .put("name", "BrowserDiag")
+                    .put("title", "BrowserDiag Android MCP")
+                    .put("version", APP_VERSION)
+            )
+            .put("instructions", MCP_INSTRUCTIONS)
+    }
+
+    private fun discoverResult(): JSONObject = JSONObject()
+        .put("resultType", "complete")
+        .put("supportedVersions", JSONArray(MCP_SUPPORTED_VERSIONS))
+        .put("capabilities", JSONObject().put("tools", JSONObject()))
+        .put(
+            "_meta",
+            JSONObject().put(
+                "io.modelcontextprotocol/serverInfo",
+                JSONObject().put("name", "BrowserDiag").put("title", "BrowserDiag Android MCP").put("version", APP_VERSION)
+            )
+        )
+        .put("instructions", MCP_INSTRUCTIONS)
+        .put("ttlMs", 300_000)
+        .put("cacheScope", "private")
+
+    private fun listToolsResult(): JSONObject = JSONObject()
+        .put("resultType", "complete")
+        .put("tools", mcpToolDefinitions())
+        .put("ttlMs", 300_000)
+        .put("cacheScope", "private")
+
+    private fun mcpToolDefinitions(): JSONArray {
+        fun stringProperty(description: String, values: List<String>? = null): JSONObject =
+            JSONObject().put("type", "string").put("description", description).also { schema ->
+                values?.let { schema.put("enum", JSONArray(it)) }
+            }
+        fun integerProperty(description: String, minimum: Int? = null, maximum: Int? = null): JSONObject =
+            JSONObject().put("type", "integer").put("description", description).also { schema ->
+                minimum?.let { schema.put("minimum", it) }
+                maximum?.let { schema.put("maximum", it) }
+            }
+        fun booleanProperty(description: String): JSONObject = JSONObject().put("type", "boolean").put("description", description)
+        fun objectProperty(description: String): JSONObject =
+            JSONObject().put("type", "object").put("description", description).put("additionalProperties", true)
+        fun tool(
+            name: String,
+            title: String,
+            description: String,
+            properties: JSONObject = JSONObject(),
+            required: List<String> = emptyList()
+        ): JSONObject {
+            val schema = JSONObject()
+                .put("type", "object")
+                .put("properties", properties)
+                .put("additionalProperties", false)
+            if (required.isNotEmpty()) schema.put("required", JSONArray(required))
+            return JSONObject()
+                .put("name", name)
+                .put("title", title)
+                .put("description", description)
+                .put("inputSchema", schema)
+        }
+        fun props(vararg pairs: Pair<String, JSONObject>): JSONObject = JSONObject().also { out ->
+            pairs.forEach { (key, value) -> out.put(key, value) }
+        }
+
+        return JSONArray()
+            .put(tool("browser_state", "浏览器状态", "获取当前页面标题、URL、加载状态与错误统计"))
+            .put(tool(
+                "browser_open", "打开网页", "在当前标签打开 HTTP(S) 页面并等待加载",
+                props(
+                    "url" to stringProperty("要打开的 HTTP(S) URL"),
+                    "waitMs" to integerProperty("加载后等待毫秒数", 1000, 15000)
+                ), listOf("url")
+            ))
+            .put(tool(
+                "browser_console", "Console 日志", "读取当前浏览会话的 Console 日志",
+                props(
+                    "type" to stringProperty("可选日志级别过滤"),
+                    "limit" to integerProperty("最多返回条数", 1, 200)
+                )
+            ))
+            .put(tool("browser_network", "网络诊断", "读取 fetch/XHR 网络记录与失败请求"))
+            .put(tool(
+                "browser_eval", "执行 JavaScript", "在当前页面执行 JavaScript 表达式",
+                props("expression" to stringProperty("JavaScript 表达式")), listOf("expression")
+            ))
+            .put(tool("browser_screenshot", "页面截图", "截取当前 WebView 为 PNG 并返回 base64"))
+            .put(tool("browser_perf", "性能指标", "读取 Navigation/Resource Timing 性能摘要"))
+            .put(tool("browser_report", "诊断报告", "汇总 Console、Network 与性能问题"))
+            .put(tool("browser_source", "页面源码", "获取当前页面 HTML 源码（有大小上限）"))
+            .put(tool("browser_tabs", "标签页", "列出 BrowserDiag 当前所有标签页"))
+            .put(tool("browser_text", "页面正文", "提取当前页面可读正文文本"))
+            .put(tool("browser_interactive", "可交互元素", "列出当前页面可见的链接、按钮与输入控件"))
+            .put(tool(
+                "browser_history", "浏览历史", "搜索最近浏览历史",
+                props(
+                    "keyword" to stringProperty("标题或 URL 关键词"),
+                    "limit" to integerProperty("最多返回条数", 1, 100)
+                )
+            ))
+            .put(tool(
+                "browser_bookmarks", "书签", "搜索、添加或删除书签",
+                props(
+                    "action" to stringProperty("操作", listOf("search", "add", "delete")),
+                    "name" to stringProperty("书签名称"),
+                    "title" to stringProperty("书签标题别名"),
+                    "url" to stringProperty("HTTP(S) URL"),
+                    "keyword" to stringProperty("搜索关键词")
+                )
+            ))
+            .put(tool(
+                "browser_http", "HTTP 请求", "从 Android 侧执行受大小限制的 HTTP GET",
+                props(
+                    "url" to stringProperty("HTTP(S) URL"),
+                    "timeoutMs" to integerProperty("超时毫秒数", 1000, 30000),
+                    "headers" to objectProperty("附加请求 Header")
+                ), listOf("url")
+            ))
+            .put(tool("browser_netlog", "网络日志", "读取当前页面最近的详细网络日志"))
+            .put(tool(
+                "browser_network_rules", "网络实验室规则", "查询、创建、更新、启停或删除网络重写规则和命中记录",
+                props(
+                    "operation" to stringProperty("操作", listOf("list", "hits", "add", "update", "enable", "delete", "clear_hits")),
+                    "op" to stringProperty("operation 的兼容别名"),
+                    "id" to stringProperty("规则 ID"),
+                    "enabled" to booleanProperty("启用或停用"),
+                    "limit" to integerProperty("命中记录上限", 1, 200),
+                    "rule" to objectProperty("NetworkRule 对象")
+                )
+            ))
+            .put(tool("browser_close", "关闭当前页面", "停止加载并把当前 WebView 重置为 about:blank"))
+    }
+
+    private fun jsonRpcError(id: Any?, code: Int, message: String): JSONObject = JSONObject()
+        .put("jsonrpc", "2.0")
+        .put("id", id ?: JSONObject.NULL)
+        .put("error", JSONObject().put("code", code).put("message", message))
+
+    private fun mcpAcceptedResponse(session: IHTTPSession): Response =
+        newFixedLengthResponse(Response.Status.ACCEPTED, "application/json; charset=utf-8", "").also {
+            addMcpHeaders(it, session)
+        }
+
+    private fun mcpErrorResponse(
+        session: IHTTPSession,
+        status: Response.Status,
+        code: Int,
+        message: String
+    ): Response = mcpJsonResponse(session, status, jsonRpcError(JSONObject.NULL, code, message).toString())
+
+    private fun mcpJsonResponse(session: IHTTPSession, status: Response.Status, json: String): Response =
+        newFixedLengthResponse(status, "application/json; charset=utf-8", json).also {
+            addMcpHeaders(it, session)
+        }
+
+    private fun addMcpHeaders(response: Response, session: IHTTPSession) {
+        val origin = header(session, "Origin")
+        if (!origin.isNullOrBlank() && isTrustedOriginValue(origin)) {
+            response.addHeader("Access-Control-Allow-Origin", origin)
+            response.addHeader("Vary", "Origin")
+        }
+        response.addHeader("Access-Control-Allow-Methods", "POST, OPTIONS")
+        response.addHeader(
+            "Access-Control-Allow-Headers",
+            "Content-Type, Authorization, X-BrowserDiag-Token, MCP-Protocol-Version, Mcp-Method, Mcp-Name, Mcp-Session-Id"
+        )
+        response.addHeader(
+            "Access-Control-Expose-Headers",
+            "MCP-Protocol-Version, Mcp-Session-Id"
+        )
+        header(session, "MCP-Protocol-Version")
+            ?.takeIf { it.isNotBlank() }
+            ?.let { response.addHeader("MCP-Protocol-Version", it) }
+        response.addHeader("Cache-Control", "no-store")
+        response.addHeader("X-Content-Type-Options", "nosniff")
+    }
+
+    private fun isMcpAuthorized(session: IHTTPSession): Boolean {
+        if (isAuthorized(session)) return true
+        val settings = getSettings()
+        return settings.lanApiEnabled && settings.mcpUrlOnlyCompatibility
+    }
+
+    private fun isTrustedMcpOrigin(session: IHTTPSession): Boolean {
+        val origin = header(session, "Origin") ?: return true
+        return isTrustedOriginValue(origin)
+    }
+
+    /** 只接受 localhost 或字面私网 IP Origin，避免 DNS rebinding 域名借浏览器访问本地 MCP。 */
+    private fun isTrustedOriginValue(origin: String): Boolean {
+        val url = runCatching { URL(origin) }.getOrNull() ?: return false
+        if (!url.protocol.equals("http", true) && !url.protocol.equals("https", true)) return false
+        val host = url.host.lowercase()
+        if (host == "localhost") return true
+        val ipv6 = host.removePrefix("[").removeSuffix("]")
+        if (ipv6.contains(':')) {
+            return ipv6 == "::1" || ipv6.startsWith("fc") || ipv6.startsWith("fd") || ipv6.startsWith("fe80:")
+        }
+        val ipv4 = host.split('.').map { it.toIntOrNull() }
+        if (ipv4.size == 4 && ipv4.all { it != null && it in 0..255 }) {
+            val octets = ipv4.map { it!! }
+            return octets[0] == 10 || octets[0] == 127 ||
+                (octets[0] == 192 && octets[1] == 168) ||
+                (octets[0] == 172 && octets[1] in 16..31) ||
+                (octets[0] == 169 && octets[1] == 254)
+        }
+        return false
+    }
+
+    private fun header(session: IHTTPSession, name: String): String? =
+        session.headers.entries.firstOrNull { it.key.equals(name, ignoreCase = true) }?.value
 
     /** 获取当前页面 HTML 源码（供 AI 分析与后续开发） */
     private fun source(): JSONObject {
@@ -435,7 +794,7 @@ class DiagServer(
             val timeout = params.optInt("timeoutMs", 10000).coerceIn(1000, 30000)
             conn.connectTimeout = timeout
             conn.readTimeout = timeout
-            conn.setRequestProperty("User-Agent", "BrowserDiag/3.4")
+            conn.setRequestProperty("User-Agent", "BrowserDiag/3.5")
             conn.setRequestProperty("Accept", "*/*")
             // 附加请求头（JSON 对象）
             val headers = params.optJSONObject("headers")
@@ -609,6 +968,23 @@ class DiagServer(
         private const val MAX_REQUEST_BYTES = 256 * 1024
         private const val MAX_HTTP_RESPONSE_BYTES = 512 * 1024
         private const val MAX_SOURCE_CHARS = 500_000
+        private const val APP_VERSION = "3.5.0"
+        private const val MCP_CURRENT_VERSION = "2026-07-28"
+        private const val MCP_LEGACY_VERSION = "2025-11-25"
+        private const val MCP_INSTRUCTIONS =
+            "BrowserDiag controls and diagnoses the Android WebView. Use browser_state before mutating navigation; network rewrite rules are managed by browser_network_rules."
+        private val MCP_SUPPORTED_VERSIONS = listOf(
+            MCP_CURRENT_VERSION,
+            MCP_LEGACY_VERSION,
+            "2025-06-18",
+            "2025-03-26"
+        )
+        private val LEGACY_MCP_VERSIONS = setOf(
+            MCP_LEGACY_VERSION,
+            "2025-06-18",
+            "2025-03-26",
+            "2024-11-05"
+        )
     }
 }
 

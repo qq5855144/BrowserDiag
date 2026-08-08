@@ -243,10 +243,15 @@ class Settings(private val ctx: Context) {
         get() = prefs.getBoolean("debug_web", false)
         set(v) = prefs.edit().putBoolean("debug_web", v).apply()
 
-    // ---------- MCP HTTP Bridge 安全 ----------
+    // ---------- MCP Streamable HTTP / HTTP Bridge 安全 ----------
     var lanApiEnabled: Boolean
         get() = prefs.getBoolean("lan_api_enabled", false)
         set(v) = prefs.edit().putBoolean("lan_api_enabled", v).apply()
+
+    /** 仅适合可信局域网：允许标准 MCP endpoint 不携带 Token，方便只支持填写 URL 的客户端。 */
+    var mcpUrlOnlyCompatibility: Boolean
+        get() = prefs.getBoolean("mcp_url_only_compatibility", false)
+        set(v) = prefs.edit().putBoolean("mcp_url_only_compatibility", v).apply()
 
     val apiToken: String
         get() {

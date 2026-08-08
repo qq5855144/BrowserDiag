@@ -1,9 +1,18 @@
-# BrowserDiag v3.4
+# BrowserDiag v3.5
 
 BrowserDiag 是面向 AI 与开发者的 Web 浏览器诊断工具，包含两个运行形态：
 
 1. **Node MCP 服务**（`mcp-server/`）：提供 MCP stdio、CLI 和带 Token 认证的 HTTP 模式，基于 Playwright/Chromium。
-2. **Android APK**（`android/`）：独立 WebView 浏览器，内置供 MCP / AI 工具调用的 Token HTTP Bridge（界面称「MCP 接口」），可按需开启局域网访问。
+2. **Android APK**（`android/`）：独立 WebView 浏览器，内置原生 MCP Streamable HTTP 服务，并保留 Token HTTP Bridge 兼容路由，可按需开启局域网访问。
+
+## v3.5 原生 MCP Streamable HTTP
+
+- Android 端现在提供真正的 MCP JSON-RPC endpoint：标准地址为 `/mcp`，根地址 `/` 也可直接连接，因此 `http://PHONE_IP:8788` 和 `http://PHONE_IP:8788/mcp` 都可用于 MCP 客户端。
+- 同时支持当前 MCP `2026-07-28` 的无状态 `server/discover` / `tools/list` / `tools/call`，并兼容 `2025-11-25`、`2025-06-18`、`2025-03-26` 客户端的 `initialize` / `initialized` 握手。
+- 18 个 Android 浏览器工具现在直接通过 MCP `tools/list` 发现、通过 `tools/call` 调用；原有 `/api/browser_*` HTTP Bridge 继续保留给旧集成使用。
+- 远程 MCP 默认要求 `Authorization: Bearer <MCP Token>`（也兼容 `X-BrowserDiag-Token`）；开发者工具中可以复制实际 MCP URL 和 Token。
+- 对只能填写一个 MCP URL、无法配置 Header 的客户端，新增显式的「MCP URL-only 兼容」开关。它只在局域网监听已开启时可用，关闭局域网监听会自动关闭该模式。
+- MCP HTTP 层增加请求大小限制、Origin 校验、无状态响应与 CORS 预检约束；URL-only 模式会开放高权限浏览器控制，只应在可信开发/家庭网络临时使用。
 
 ## v3.4 网络实验室
 
@@ -59,7 +68,7 @@ Android UI 采用 Chrome / Material 3 风格重新设计：顶部 Omnibox 集成
 
 用户脚本支持在网页中直接识别标准 `.user.js` 安装链接，也可粘贴脚本 URL 或手动创建；安装前展示名称、版本、来源、匹配/排除范围与兼容性提醒。媒体嗅探会合并 DOM 媒体、Performance 与 XHR/fetch 请求，识别视频、音频、HLS/DASH 清单并折叠媒体分片，同时提供格式、来源、大小/状态信息以及预览、下载和复制操作。
 
-Android「MCP 接口」当前通过 Token 认证的 HTTP Bridge 暴露 18 个调用路由；它是给 MCP / AI 客户端使用的桥接接口，并非原生 MCP transport：
+Android「MCP 接口」通过原生 Streamable HTTP 暴露以下 18 个工具；MCP endpoint 为 `/mcp`（根 `/` 是兼容别名），旧版 `/api/browser_*` HTTP Bridge 仍可直接调用同一实现：
 
 | 调用路由 | 作用 |
 |---|---|
@@ -112,9 +121,29 @@ cd android
 ./gradlew assembleRelease
 ```
 
-首次启动时 MCP 接口仅绑定本机。打开「工具 → 开发者工具」可复制实际 HTTP Bridge 地址和 MCP Token。需要电脑通过同一局域网访问时，再打开「工具 → 局域网 MCP 接口」。
+首次启动时 MCP 接口仅绑定本机。需要电脑通过同一局域网访问时，先打开「工具 → BrowserDiag → 局域网 MCP 接口」，再到「工具 → 开发者工具」复制实际 MCP URL 和 MCP Token。
 
-请求示例：
+推荐配置（客户端支持自定义 Header）：
+
+```text
+URL: http://PHONE_IP:8788/mcp
+Authorization: Bearer YOUR_MCP_TOKEN
+```
+
+根地址也可直接作为 MCP URL：`http://PHONE_IP:8788`。
+
+如果 AI 客户端的 MCP 面板**只能填写 URL，不能设置 Authorization Header**，请在可信局域网中额外开启「工具 → BrowserDiag → MCP URL-only 兼容」，之后直接填写 `http://PHONE_IP:8788` 即可。该模式不需要 Token，使用完成后建议关闭。
+
+原生 MCP `initialize` 烟测示例：
+
+```bash
+curl -s -X POST http://PHONE_IP:8788/mcp \
+  -H "Authorization: Bearer YOUR_MCP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"smoke-test","version":"1"}}}'
+```
+
+旧 HTTP Bridge 请求示例：
 
 ```bash
 curl -s -X POST http://PHONE_IP:8788/api/browser_open \
@@ -125,7 +154,8 @@ curl -s -X POST http://PHONE_IP:8788/api/browser_open \
 
 ## 安全说明
 
-- Android MCP 接口含任意 JS、页面源码和自定义 HTTP 请求等高权限能力，因此其 HTTP Bridge 强制 Token 认证。
+- Android MCP 接口含任意 JS、页面源码和自定义 HTTP 请求等高权限能力，因此默认要求随机 Token；旧 `/api/*` HTTP Bridge 始终要求 Token。
+- 「MCP URL-only 兼容」仅用于无法设置认证 Header 的 MCP 客户端。开启后，任何能访问该 MCP 端口的设备都可能调用这些高权限能力；不要在公共 Wi-Fi、端口转发或不可信网络环境中启用。
 - Android 默认关闭局域网监听，并关闭应用数据备份，避免历史、书签、用户脚本与 MCP Token 被系统备份。
 - 不要把 `BROWSERDIAG_TOKEN` 写入仓库；`.env` 已加入忽略规则。
 - WebView 远程调试默认关闭，只在用户显式开启时生效。
