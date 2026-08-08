@@ -794,7 +794,7 @@ class DiagServer(
             val timeout = params.optInt("timeoutMs", 10000).coerceIn(1000, 30000)
             conn.connectTimeout = timeout
             conn.readTimeout = timeout
-            conn.setRequestProperty("User-Agent", "BrowserDiag/3.5")
+            conn.setRequestProperty("User-Agent", "BrowserDiag/3.6")
             conn.setRequestProperty("Accept", "*/*")
             // 附加请求头（JSON 对象）
             val headers = params.optJSONObject("headers")
@@ -968,7 +968,7 @@ class DiagServer(
         private const val MAX_REQUEST_BYTES = 256 * 1024
         private const val MAX_HTTP_RESPONSE_BYTES = 512 * 1024
         private const val MAX_SOURCE_CHARS = 500_000
-        private const val APP_VERSION = "3.5.0"
+        private const val APP_VERSION = "3.6.0"
         private const val MCP_CURRENT_VERSION = "2026-07-28"
         private const val MCP_LEGACY_VERSION = "2025-11-25"
         private const val MCP_INSTRUCTIONS =

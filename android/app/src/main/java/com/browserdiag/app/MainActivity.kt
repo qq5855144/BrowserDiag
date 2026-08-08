@@ -81,7 +81,7 @@ import java.util.Locale
 import java.util.WeakHashMap
 
 /**
- * BrowserDiag 3.5：Chrome 风格底部导航浏览器 + 原生 MCP Streamable HTTP + 网络实验室。
+ * BrowserDiag 3.6：Chrome 风格底部导航浏览器 + 后台原生 MCP Streamable HTTP + 网络实验室。
  * 功能：多标签 / 搜索引擎切换 / UA 切换 / 深色主题 / 油猴脚本 / 书签 / 保存页面 / 分享 /
  * 页面查找 / 翻译 / 媒体嗅探 / 页面资源 / 源码 zip / 语音播报 / 二维码 / 添加到桌面 / 历史。
  * 平时可作普通浏览器使用，也可作为诊断后端供其它 AI 工具通过 HTTP 调用。
@@ -107,7 +107,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var forwardButton: LinearLayout
     private lateinit var tabsNavButton: LinearLayout
     private val consoleLogs = mutableListOf<JSONObject>()
-    private var server: DiagServer? = null
     private var serverPort = 8788
     private var tts: TextToSpeech? = null
     private var isDark = false
@@ -134,6 +133,14 @@ class MainActivity : AppCompatActivity() {
         settings = Settings(this)
         networkRules = NetworkRuleStore(this)
         tabs = Tabs(this)
+        McpRuntime.attach(
+            owner = this,
+            getWebView = { tabs.current?.webView },
+            getConsoleLogs = { synchronized(consoleLogs) { consoleLogs.toList() } },
+            getTabs = { tabs },
+            getNetworkRuleStore = { networkRules },
+            onNetworkRulesChanged = { runOnUiThread { refreshNetworkRuleHooks() } },
+        )
         isDark = settings.darkMode
         theme.applyStyle(
             if (isDark) R.style.ThemeOverlay_BrowserDiag_Dark else R.style.ThemeOverlay_BrowserDiag_Light,
@@ -146,6 +153,7 @@ class MainActivity : AppCompatActivity() {
         installBackNavigation()
         newTab(initialUrlFromIntent(intent) ?: settings.engine.homeUrl)
         startServer()
+        syncMcpKeepAliveService()
         applyTheme()
     }
 
@@ -519,8 +527,9 @@ class MainActivity : AppCompatActivity() {
     private fun buildStatusText(): String {
         val errs = synchronized(consoleLogs) { consoleLogs.filter { it.optString("type") == "error" }.size }
         val scope = if (settings.lanApiEnabled) "局域网" else "本机"
-        val mcp = if (server == null) "MCP 接口未启动" else "MCP $scope:${serverPort}"
-        return "$mcp  ·  Console ${consoleLogs.size}/$errs  ·  点击诊断"
+        val mcp = if (!McpServerHost.isRunning) "MCP 接口未启动" else "MCP $scope:${serverPort}"
+        val background = if (settings.lanApiEnabled && settings.backgroundMcpEnabled) " · 后台保活" else ""
+        return "$mcp$background  ·  Console ${consoleLogs.size}/$errs  ·  点击诊断"
     }
 
     private fun reloadOrStop() {
@@ -1355,13 +1364,29 @@ class MainActivity : AppCompatActivity() {
             listOf(
                 MenuItem("lanapi", R.drawable.ic_link, "局域网 MCP 接口", if (settings.lanApiEnabled) "已开启 · Streamable HTTP · Token 认证" else "已关闭 · 仅本机") { toggleLanApi() },
                 MenuItem(
+                    "mcpbackground",
+                    R.drawable.ic_network,
+                    "后台 MCP 保活",
+                    when {
+                        !settings.lanApiEnabled -> "开启局域网 MCP 后生效"
+                        settings.backgroundMcpEnabled -> "已开启 · 前台服务 + Wi-Fi/CPU 保活"
+                        else -> "已关闭 · 切换应用后可能断开"
+                    }
+                ) { toggleBackgroundMcp() },
+                MenuItem(
+                    "mcpbattery",
+                    R.drawable.ic_settings,
+                    "系统后台权限",
+                    if (isBatteryOptimizationIgnored()) "电池优化已放宽" else "建议设为不限制/不优化 · 厂商系统可能需要"
+                ) { openBackgroundPowerSettings() },
+                MenuItem(
                     "mcpcompat",
                     R.drawable.ic_shield,
                     "MCP URL-only 兼容",
                     if (settings.mcpUrlOnlyCompatibility) "已开启 · 仅限可信局域网" else "已关闭 · 推荐 Token 模式"
                 ) { toggleMcpUrlOnlyCompatibility() },
                 MenuItem("menuconfig", R.drawable.ic_settings, "常用工具设置", "选择工具中心的常用快捷入口") { showMenuConfig() },
-                MenuItem("about", R.drawable.ic_info, "关于 BrowserDiag", "v3.5.0 · MCP ${serverPort}") { showAbout() }
+                MenuItem("about", R.drawable.ic_info, "关于 BrowserDiag", "v3.6.0 · MCP ${serverPort}") { showAbout() }
             )
         )
     )
@@ -2172,6 +2197,20 @@ class MainActivity : AppCompatActivity() {
                 onClick = { copyText(token) }
             ))
             content.addView(panelRow(
+                R.drawable.ic_network,
+                "后台 MCP 保活",
+                when {
+                    !settings.lanApiEnabled -> "当前仅本机；开启局域网 MCP 后可后台持续连接"
+                    settings.backgroundMcpEnabled -> "运行中 · 前台服务 + CPU/Wi-Fi 保活 · 点击关闭"
+                    else -> "已关闭 · 点击开启，切换到 AI 客户端后保持连接"
+                },
+                selected = settings.lanApiEnabled && settings.backgroundMcpEnabled,
+                onClick = {
+                    dialog.dismiss()
+                    toggleBackgroundMcp()
+                }
+            ))
+            content.addView(panelRow(
                 R.drawable.ic_shield,
                 "只填写 URL 的客户端",
                 if (settings.mcpUrlOnlyCompatibility) {
@@ -2216,7 +2255,7 @@ class MainActivity : AppCompatActivity() {
                 }
             ))
             content.addView(TextView(this).apply {
-                text = "这里现在是真正的 MCP Streamable HTTP 服务：支持 2026-07-28 server/discover，并兼容 2025.x initialize/initialized、tools/list、tools/call。推荐使用 Bearer Token；URL-only 模式会把高权限浏览器控制开放给同一局域网设备，仅在可信网络使用。"
+                text = "这里是真正的 MCP Streamable HTTP 服务：支持 2026-07-28 server/discover，并兼容 2025.x initialize/initialized、tools/list、tools/call。后台保活开启后，切到 AI 客户端或锁屏仍由前台服务维持 MCP；推荐使用 Bearer Token，URL-only 仅在可信网络使用。"
                 textSize = 12.5f
                 setTextColor(secondaryTextColor())
                 setPadding(14.dp(), 16.dp(), 14.dp(), 8.dp())
@@ -2750,8 +2789,8 @@ class MainActivity : AppCompatActivity() {
         val api = apiBaseUrl()
         val token = settings.apiToken
         val ua = currentWeb()?.settings?.userAgentString ?: ""
-        showBrowserSheet("BrowserDiag", "安全浏览 + 页面诊断 · v3.5.0") { content, _ ->
-            content.addView(panelRow(R.drawable.ic_info, "BrowserDiag 3.5.0", "Android 浏览器、网络实验室与原生 MCP 服务"))
+        showBrowserSheet("BrowserDiag", "安全浏览 + 页面诊断 · v3.6.0") { content, _ ->
+            content.addView(panelRow(R.drawable.ic_info, "BrowserDiag 3.6.0", "Android 浏览器、网络实验室与后台原生 MCP 服务"))
             content.addView(panelRow(R.drawable.ic_network, "MCP Streamable HTTP", "${mcpEndpointUrl()} · Token 认证", onClick = {
                 copyText(mcpEndpointUrl())
             }))
@@ -3606,10 +3645,70 @@ class MainActivity : AppCompatActivity() {
         settings.lanApiEnabled = !settings.lanApiEnabled
         if (!settings.lanApiEnabled) settings.mcpUrlOnlyCompatibility = false
         restartServer()
+        if (settings.lanApiEnabled && settings.backgroundMcpEnabled) ensureMcpNotificationPermission()
         toast(
-            if (settings.lanApiEnabled) "局域网 MCP 已开启（Streamable HTTP · 默认 Token 认证）"
+            if (settings.lanApiEnabled) {
+                if (settings.backgroundMcpEnabled) "局域网 MCP 已开启 · 后台保活运行中"
+                else "局域网 MCP 已开启（后台保活已关闭）"
+            }
             else "局域网 MCP 接口已关闭，仅本机可访问"
         )
+    }
+
+    private fun toggleBackgroundMcp() {
+        if (!settings.lanApiEnabled) {
+            toast("请先开启“局域网 MCP 接口”")
+            return
+        }
+        settings.backgroundMcpEnabled = !settings.backgroundMcpEnabled
+        if (settings.backgroundMcpEnabled) ensureMcpNotificationPermission()
+        syncMcpKeepAliveService()
+        statusBar.text = buildStatusText()
+        toast(
+            if (settings.backgroundMcpEnabled) "后台 MCP 保活已开启 · 可切换到 AI 客户端"
+            else "后台 MCP 保活已关闭"
+        )
+    }
+
+    private fun ensureMcpNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                MCP_NOTIFICATION_PERMISSION_REQUEST,
+            )
+        }
+    }
+
+    private fun isBatteryOptimizationIgnored(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return true
+        val power = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+        return power.isIgnoringBatteryOptimizations(packageName)
+    }
+
+    private fun openBackgroundPowerSettings() {
+        val intent = Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+        val opened = runCatching { startActivity(intent) }.isSuccess
+        if (!opened) {
+            runCatching {
+                startActivity(
+                    Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                        .setData(Uri.parse("package:$packageName"))
+                )
+            }.onFailure { toast("无法打开系统后台设置") }
+        }
+    }
+
+    private fun syncMcpKeepAliveService() {
+        if (settings.lanApiEnabled && settings.backgroundMcpEnabled && McpServerHost.isRunning) {
+            runCatching { McpKeepAliveService.start(this, mcpEndpointUrl()) }
+                .onFailure { statusBar.text = "MCP 已启动，但后台服务启动失败：${it.message}" }
+        } else {
+            McpKeepAliveService.stop(this)
+        }
     }
 
     private fun toggleMcpUrlOnlyCompatibility() {
@@ -3773,41 +3872,22 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun restartServer() {
-        server?.stop()
-        server = null
-        startServer()
+        val port = McpServerHost.restart(applicationContext)
+        if (port == null) {
+            statusBar.text = "MCP 接口启动失败（端口 8788-8791 均被占用）"
+        } else {
+            serverPort = port
+            statusBar.text = buildStatusText()
+        }
+        syncMcpKeepAliveService()
     }
 
     private fun startServer() {
-        val listenHost = if (settings.lanApiEnabled) "0.0.0.0" else "127.0.0.1"
-        var port = 8788
-        var started = false
-        while (port < 8792) {
-            try {
-                val s = DiagServer(
-                    listenHost,
-                    port,
-                    applicationContext,
-                    { tabs.current?.webView },
-                    { synchronized(consoleLogs) { consoleLogs.toList() } },
-                    { settings },
-                    { tabs },
-                    { networkRules },
-                    { runOnUiThread { refreshNetworkRuleHooks() } },
-                    settings.apiToken
-                )
-                s.start(5000, true)
-                server = s
-                serverPort = port
-                started = true
-                break
-            } catch (e: Exception) {
-                port++
-            }
-        }
-        if (!started) {
+        val port = McpServerHost.ensureStarted(applicationContext)
+        if (port == null) {
             statusBar.text = "MCP 接口启动失败（端口 8788-8791 均被占用）"
         } else {
+            serverPort = port
             statusBar.text = buildStatusText()
         }
     }
@@ -3836,7 +3916,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        server?.stop()
+        McpRuntime.detach(this)
+        if (!settings.lanApiEnabled || !settings.backgroundMcpEnabled) {
+            McpServerHost.stop()
+            McpKeepAliveService.stop(this)
+        }
         tts?.stop()
         tts?.shutdown()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -3905,6 +3989,7 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val LEGACY_STORAGE_PERMISSION_REQUEST = 4101
+        private const val MCP_NOTIFICATION_PERMISSION_REQUEST = 4102
         private const val BACK_TO_EXIT_INTERVAL_MS = 2_000L
 
         /** 广告拦截域名黑名单（子域名自动匹配） */

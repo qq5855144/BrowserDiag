@@ -1,9 +1,19 @@
-# BrowserDiag v3.5
+# BrowserDiag v3.6
 
 BrowserDiag 是面向 AI 与开发者的 Web 浏览器诊断工具，包含两个运行形态：
 
 1. **Node MCP 服务**（`mcp-server/`）：提供 MCP stdio、CLI 和带 Token 认证的 HTTP 模式，基于 Playwright/Chromium。
 2. **Android APK**（`android/`）：独立 WebView 浏览器，内置原生 MCP Streamable HTTP 服务，并保留 Token HTTP Bridge 兼容路由，可按需开启局域网访问。
+
+## v3.6 后台 MCP 保活
+
+- 新增 Android Foreground Service：开启「局域网 MCP 接口」后默认启用后台 MCP 保活，切换到 AI 客户端、回到桌面或锁屏时不再因 App 进入后台而主动中断 MCP。
+- MCP Server 从 `MainActivity` 生命周期中拆出，由进程级 `McpServerHost` 统一持有；Activity 存活时自动挂接当前 WebView，Activity 被销毁后协议 endpoint 仍可由前台服务维持/恢复，再次打开 App 后重新挂接浏览器运行时。
+- 后台服务使用 `connectedDevice` 类型的前台服务，并通过低优先级持续通知明确展示运行状态；通知可一键返回 BrowserDiag 或停止后台保活。
+- 加入有界续期 Partial WakeLock 与 Wi-Fi High Performance Lock，减少锁屏/切换应用后 CPU 或 Wi-Fi 休眠导致的局域网 MCP 断连；关闭后台保活会立即释放锁。
+- 「后台 MCP 保活」可在「工具 → BrowserDiag」或「开发者工具」独立开关；局域网 MCP 关闭时后台服务自动停止。
+- 新增「系统后台权限」入口并显示电池优化状态，方便在 Vivo 等具有额外省电策略的系统上把 BrowserDiag 设为“不优化/允许后台运行”。
+- Android 13+ 会申请通知权限；即使系统拒绝普通通知显示权限，Foreground Service 仍按 Android 的前台服务规则运行。
 
 ## v3.5 原生 MCP Streamable HTTP
 
@@ -121,7 +131,7 @@ cd android
 ./gradlew assembleRelease
 ```
 
-首次启动时 MCP 接口仅绑定本机。需要电脑通过同一局域网访问时，先打开「工具 → BrowserDiag → 局域网 MCP 接口」，再到「工具 → 开发者工具」复制实际 MCP URL 和 MCP Token。
+首次启动时 MCP 接口仅绑定本机。需要电脑或同机 AI 客户端通过局域网地址访问时，先打开「工具 → BrowserDiag → 局域网 MCP 接口」，后台 MCP 保活会默认同时启用；再到「工具 → 开发者工具」复制实际 MCP URL 和 MCP Token。之后可直接切换到 AI 客户端，BrowserDiag 的持续通知表示后台 MCP 正在运行。
 
 推荐配置（客户端支持自定义 Header）：
 
@@ -156,6 +166,7 @@ curl -s -X POST http://PHONE_IP:8788/api/browser_open \
 
 - Android MCP 接口含任意 JS、页面源码和自定义 HTTP 请求等高权限能力，因此默认要求随机 Token；旧 `/api/*` HTTP Bridge 始终要求 Token。
 - 「MCP URL-only 兼容」仅用于无法设置认证 Header 的 MCP 客户端。开启后，任何能访问该 MCP 端口的设备都可能调用这些高权限能力；不要在公共 Wi-Fi、端口转发或不可信网络环境中启用。
+- 后台 MCP 使用前台服务与 CPU/Wi-Fi 保活，会比普通后台 App 增加一定耗电；不再使用 AI/MCP 时可从 BrowserDiag 或持续通知关闭后台保活。系统“强行停止/Force stop”应用后，Android 会停止所有组件，任何应用都无法绕过这一系统语义。
 - Android 默认关闭局域网监听，并关闭应用数据备份，避免历史、书签、用户脚本与 MCP Token 被系统备份。
 - 不要把 `BROWSERDIAG_TOKEN` 写入仓库；`.env` 已加入忽略规则。
 - WebView 远程调试默认关闭，只在用户显式开启时生效。

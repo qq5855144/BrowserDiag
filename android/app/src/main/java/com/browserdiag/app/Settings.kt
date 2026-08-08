@@ -248,6 +248,11 @@ class Settings(private val ctx: Context) {
         get() = prefs.getBoolean("lan_api_enabled", false)
         set(v) = prefs.edit().putBoolean("lan_api_enabled", v).apply()
 
+    /** 局域网 MCP 开启时默认用前台 Service 保持 AI 客户端后台连接。 */
+    var backgroundMcpEnabled: Boolean
+        get() = prefs.getBoolean("background_mcp_enabled", true)
+        set(v) = prefs.edit().putBoolean("background_mcp_enabled", v).apply()
+
     /** 仅适合可信局域网：允许标准 MCP endpoint 不携带 Token，方便只支持填写 URL 的客户端。 */
     var mcpUrlOnlyCompatibility: Boolean
         get() = prefs.getBoolean("mcp_url_only_compatibility", false)
