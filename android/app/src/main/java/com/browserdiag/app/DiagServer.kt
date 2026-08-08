@@ -146,7 +146,7 @@ class DiagServer(
     /**
      * 旧 MCP 客户端通常只拿到一个 URL：GET，且没有 MCP-Protocol-Version。
      * Streamable HTTP 客户端会以 POST 开场（2026 直接请求/发现，2025 initialize）；因此根 URL 的 GET 可无歧义回退 SSE。
-     * 一些移动客户端错误地发送 Accept: */*，这里也兼容；2026 客户端会携带版本 Header，不会误入 SSE。
+     * 一些移动客户端只发送通配 Accept，这里也兼容；2026 客户端会携带版本 Header，不会误入 SSE。
      */
     private fun isLegacySseFallbackRequest(session: IHTTPSession): Boolean =
         isMcpEndpoint(session.uri) &&
