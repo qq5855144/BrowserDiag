@@ -1,9 +1,19 @@
-# BrowserDiag v3.2
+# BrowserDiag v3.3
 
 BrowserDiag 是面向 AI 与开发者的 Web 浏览器诊断工具，包含两个运行形态：
 
 1. **Node MCP 服务**（`mcp-server/`）：提供 MCP stdio、CLI 和带 Token 认证的 HTTP 模式，基于 Playwright/Chromium。
 2. **Android APK**（`android/`）：独立 WebView 浏览器，内置本机诊断 HTTP API，可按需开启局域网访问。
+
+## v3.3 浏览与诊断增强
+
+- 标签容量由 5 提升至 8，底层不再在达到上限时静默销毁旧标签；支持关闭当前、单独关闭和确认关闭全部。
+- 用户脚本支持网页 `.user.js` 识别、URL 安装、元数据/匹配范围预览、更新识别与运行时 include/exclude 校验。
+- 媒体嗅探合并 DOM、Performance、XHR/fetch 信号，区分视频、音频、HLS/DASH 和分片，并提供格式、大小、状态与操作入口。
+- 页面资源改为 DOM + Performance 双来源分类面板，自动去重并识别图片、脚本、样式、字体和媒体，不再只展示 URL。
+- Network 面板展示方法、状态、请求类型、MIME、大小和耗时，异常请求醒目标记，并支持清空与复制诊断信息。
+- 普通下载、媒体下载和资源下载统一携带 Cookie、Referer 与 User-Agent；下载中心显示任务进度、大小和失败状态。
+- 地址栏可正确识别 `example.com/path`、IP:port 与 localhost；历史支持单条删除，清空操作增加确认。
 
 ## v3.2 质量增强
 

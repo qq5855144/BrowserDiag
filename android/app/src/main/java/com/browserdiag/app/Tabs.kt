@@ -9,7 +9,7 @@ import android.webkit.WebView
  * 轻量多标签管理：最多 MAX_TABS 个 WebView 实例，仅显示当前标签。
  * 每个标签独立保留页面状态（前进/后退栈、滚动位置）。
  */
-class Tabs(private val context: Context, private val maxTabs: Int = 5) {
+class Tabs(private val context: Context, val maxTabs: Int = DEFAULT_MAX_TABS) {
 
     data class Tab(val id: Int, var title: String = "", var url: String = "") {
         lateinit var webView: WebView
@@ -24,13 +24,10 @@ class Tabs(private val context: Context, private val maxTabs: Int = 5) {
     val current: Tab? get() = if (currentIndex in tabs.indices) tabs[currentIndex] else null
     val all: List<Tab> get() = tabs.toList()
 
-    /** 创建新标签（挂载到 parent 容器），返回 Tab */
+    /** 创建新标签（挂载到 parent 容器）。达到上限时返回 null，绝不静默销毁旧标签。 */
     @SuppressLint("SetJavaScriptEnabled")
-    fun create(container: ViewGroup, url: String): Tab {
-        // 超过上限：移除最旧的标签
-        while (tabs.size >= maxTabs) {
-            destroy(tabs.first().id)
-        }
+    fun create(container: ViewGroup, url: String): Tab? {
+        if (tabs.size >= maxTabs) return null
         val tab = Tab(id = nextId++, url = url)
         tab.webView = WebView(context)
         tab.webView.layoutParams = ViewGroup.LayoutParams(
@@ -88,4 +85,9 @@ class Tabs(private val context: Context, private val maxTabs: Int = 5) {
     }
 
     fun get(id: Int): Tab? = tabs.firstOrNull { it.id == id }
+
+    companion object {
+        /** WebView 标签较占内存，8 个兼顾多任务与 Android 设备稳定性。 */
+        const val DEFAULT_MAX_TABS = 8
+    }
 }

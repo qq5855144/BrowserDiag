@@ -206,6 +206,14 @@ class Settings(private val ctx: Context) {
         list.removeAll { it.first == url }
         list.add(0, url.take(4096) to title.take(512))
         if (list.size > 50) list.subList(50, list.size).clear()
+        saveHistory(list)
+    }
+
+    fun removeHistory(url: String) {
+        saveHistory(getHistory().filter { it.first != url })
+    }
+
+    private fun saveHistory(list: List<Pair<String, String>>) {
         val arr = JSONArray()
         list.forEach { (u, t) -> arr.put(JSONObject().put("url", u).put("title", t)) }
         prefs.edit().putString("history", arr.toString()).apply()

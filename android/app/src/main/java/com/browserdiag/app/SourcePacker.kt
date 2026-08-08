@@ -145,7 +145,7 @@ object SourcePacker {
         conn.connectTimeout = timeoutMs
         conn.readTimeout = timeoutMs
         conn.requestMethod = "GET"
-        conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) BrowserDiag/3.2")
+        conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) BrowserDiag/3.3")
         conn.instanceFollowRedirects = true
         return try {
             if (conn.responseCode in 200..299) {

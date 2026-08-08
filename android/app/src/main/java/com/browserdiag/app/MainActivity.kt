@@ -37,6 +37,7 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.webkit.URLUtil
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageButton
@@ -74,7 +75,7 @@ import java.net.URLEncoder
 import java.util.Locale
 
 /**
- * BrowserDiag 3.2：Chrome 风格底部导航浏览器 + 带 Token 认证的内嵌 HTTP 诊断服务器。
+ * BrowserDiag 3.3：Chrome 风格底部导航浏览器 + 带 Token 认证的内嵌 HTTP 诊断服务器。
  * 功能：多标签 / 搜索引擎切换 / UA 切换 / 深色主题 / 油猴脚本 / 书签 / 保存页面 / 分享 /
  * 页面查找 / 翻译 / 媒体嗅探 / 页面资源 / 源码 zip / 语音播报 / 二维码 / 添加到桌面 / 历史。
  * 平时可作普通浏览器使用，也可作为诊断后端供其它 AI 工具通过 HTTP 调用。
@@ -284,6 +285,13 @@ class MainActivity : AppCompatActivity() {
             textSize = 14f
             background = null
             setSingleLine(true)
+            imeOptions = EditorInfo.IME_ACTION_SEARCH
+            setOnEditorActionListener { _, actionId, _ ->
+                if (actionId == EditorInfo.IME_ACTION_SEARCH) {
+                    findNext(true)
+                    true
+                } else false
+            }
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
         findBar.addView(findInput)
@@ -808,11 +816,14 @@ class MainActivity : AppCompatActivity() {
     private fun currentWeb(): WebView? = tabs.current?.webView
 
     private fun newTab(url: String) {
-        if (tabs.size >= 5) {
-            toast("标签已达上限（5 个），请先关闭标签")
+        if (tabs.size >= tabs.maxTabs) {
+            toast("标签已达上限（${tabs.maxTabs} 个），请先关闭不需要的标签")
             return
         }
-        val tab = tabs.create(webContainer, url)
+        val tab = tabs.create(webContainer, url) ?: run {
+            toast("暂时无法创建新标签")
+            return
+        }
         configureWebView(tab.webView)
         tabs.switchTo(tab.id)
         tab.webView.loadUrl(url)
@@ -874,6 +885,9 @@ class MainActivity : AppCompatActivity() {
                     .put("ts", System.currentTimeMillis())
                     .put("type", msg.messageLevel().name.lowercase())
                     .put("text", msg.message())
+                    .put("url", wv.url.orEmpty())
+                    .put("source", msg.sourceId().orEmpty())
+                    .put("line", msg.lineNumber())
                 synchronized(consoleLogs) {
                     consoleLogs.add(entry)
                     if (consoleLogs.size > 500) consoleLogs.removeAt(0)
@@ -975,21 +989,17 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        wv.setDownloadListener(DownloadListener { url, _, _, mimeType, _ ->
+        wv.setDownloadListener(DownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
             if (isUserscriptUri(Uri.parse(url))) {
                 requestUserscriptInstall(url)
                 return@DownloadListener
             }
-            try {
-                val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-                val req = DownloadManager.Request(Uri.parse(url))
-                req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                req.setMimeType(mimeType ?: "application/octet-stream")
-                dm.enqueue(req)
-                toast("已加入下载队列")
-            } catch (e: Exception) {
-                toast("下载失败: ${e.message}")
-            }
+            enqueueDownload(
+                url = url,
+                mimeType = mimeType.orEmpty(),
+                contentDisposition = contentDisposition.orEmpty(),
+                userAgentOverride = userAgent.orEmpty()
+            )
         })
     }
 
@@ -997,7 +1007,7 @@ class MainActivity : AppCompatActivity() {
         val all = tabs.all
         showBrowserSheet(
             title = "标签页",
-            subtitle = "${all.size}/5 · 点击切换，右侧 × 关闭单个标签",
+            subtitle = "${all.size}/${tabs.maxTabs} · 点击切换，右侧 × 关闭单个标签",
             headerActionLabel = "＋ 新标签",
             headerAction = { dialog ->
                 newTab(settings.engine.homeUrl)
@@ -1082,11 +1092,27 @@ class MainActivity : AppCompatActivity() {
         when {
             q.startsWith("http://") || q.startsWith("https://") -> wv.loadUrl(q)
             q.startsWith("about:") -> wv.loadUrl(q)
-            q.contains(".") && !q.contains(" ") && !q.contains("/") && !q.contains("?") ->
+            looksLikeWebAddress(q) ->
                 wv.loadUrl("https://$q")
             else -> wv.loadUrl(engine.searchUrl.format(URLEncoder.encode(q, "UTF-8")))
         }
         urlInput.clearFocus()
+    }
+
+    /** 识别 example.com/path、IP:port、localhost 等常见地址，避免被错误送去搜索。 */
+    private fun looksLikeWebAddress(value: String): Boolean {
+        if (value.any { it.isWhitespace() }) return false
+        val parsed = runCatching { Uri.parse("https://$value") }.getOrNull() ?: return false
+        val host = parsed.host?.trim('[', ']')?.lowercase(Locale.ROOT) ?: return false
+        if (host == "localhost") return true
+        if (Regex("""^\d{1,3}(?:\.\d{1,3}){3}$""").matches(host)) {
+            return host.split('.').all { (it.toIntOrNull() ?: 256) in 0..255 }
+        }
+        return host.contains('.') && host.split('.').all { label ->
+            label.isNotBlank() && label.length <= 63 &&
+                label.first().isLetterOrDigit() && label.last().isLetterOrDigit() &&
+                label.all { it.isLetterOrDigit() || it == '-' }
+        }
     }
 
     private fun goHome() {
@@ -1118,7 +1144,7 @@ class MainActivity : AppCompatActivity() {
             listOf(
                 MenuItem("bookmark", R.drawable.ic_bookmark, "书签", "收藏和管理常用页面") { showBookmarks() },
                 MenuItem("history", R.drawable.ic_history, "历史记录", "${settings.getHistory().size} 条最近访问记录") { showHistory() },
-                MenuItem("downloads", R.drawable.ic_download, "下载内容", "查看系统下载队列与已下载文件") { showDownloads() }
+                MenuItem("downloads", R.drawable.ic_download, "下载内容", "查看下载进度、状态与已完成文件") { showDownloads() }
             )
         ),
         ToolCategory(
@@ -1127,9 +1153,9 @@ class MainActivity : AppCompatActivity() {
             "媒体、资源、源码、网络与 Console",
             listOf(
                 MenuItem("sniff", R.drawable.ic_movie, "媒体嗅探", "智能识别视频、音频、HLS/DASH 清单并折叠分片") { sniffMedia() },
-                MenuItem("resources", R.drawable.ic_folder, "页面资源", "查看图片、脚本和样式资源") { pageResources() },
+                MenuItem("resources", R.drawable.ic_folder, "页面资源", "分类识别图片、脚本、样式、字体与媒体") { pageResources() },
                 MenuItem("source", R.drawable.ic_code, "源码归档", "导出 HTML、资源、Console 与网络日志") { downloadSourceZip() },
-                MenuItem("netlog", R.drawable.ic_network, "网络日志", "查看当前页面最近的请求状态") { showNetLog() },
+                MenuItem("netlog", R.drawable.ic_network, "网络日志", "查看请求状态、类型、大小与耗时") { showNetLog() },
                 MenuItem("devtools", R.drawable.ic_tools, "开发者工具", "诊断 API、Console 与页面状态") { devTools() }
             )
         ),
@@ -1155,7 +1181,7 @@ class MainActivity : AppCompatActivity() {
             listOf(
                 MenuItem("lanapi", R.drawable.ic_link, "局域网诊断 API", if (settings.lanApiEnabled) "已开启 · Token 认证" else "已关闭 · 仅本机") { toggleLanApi() },
                 MenuItem("menuconfig", R.drawable.ic_settings, "常用工具设置", "选择工具中心的常用快捷入口") { showMenuConfig() },
-                MenuItem("about", R.drawable.ic_info, "关于 BrowserDiag", "v3.2.0 · API ${serverPort}") { showAbout() }
+                MenuItem("about", R.drawable.ic_info, "关于 BrowserDiag", "v3.3.0 · API ${serverPort}") { showAbout() }
             )
         )
     )
@@ -1358,6 +1384,7 @@ class MainActivity : AppCompatActivity() {
                         settings.removeBookmark(url)
                         toast("书签已删除")
                         dialog.dismiss()
+                        showBookmarks()
                     },
                     onClick = {
                         currentWeb()?.loadUrl(url)
@@ -1633,81 +1660,209 @@ class MainActivity : AppCompatActivity() {
             toast("Blob 临时地址不能直接下载，请寻找对应的流媒体清单")
             return
         }
+        val suggestedName = runCatching { Uri.parse(media.url).lastPathSegment.orEmpty() }.getOrDefault("")
+        enqueueDownload(
+            url = media.url,
+            mimeType = media.mime,
+            suggestedName = suggestedName,
+            successMessage = if (media.kind == "playlist") "已加入流媒体清单下载" else "已加入下载队列"
+        )
+    }
+
+    /**
+     * 所有网页下载统一携带当前浏览上下文，避免登录态、来源校验或 UA 校验导致下载失败。
+     * DownloadManager 负责最终存储与系统通知，BrowserDiag 只传递安全的请求头与显示信息。
+     */
+    private fun enqueueDownload(
+        url: String,
+        mimeType: String = "",
+        contentDisposition: String = "",
+        suggestedName: String = "",
+        userAgentOverride: String = "",
+        successMessage: String = "已加入下载队列"
+    ) {
+        val uri = runCatching { Uri.parse(url) }.getOrNull()
+        val scheme = uri?.scheme?.lowercase(Locale.ROOT)
+        if (uri == null || scheme !in setOf("http", "https")) {
+            toast("该地址不能直接交给系统下载")
+            return
+        }
         try {
-            val request = DownloadManager.Request(Uri.parse(media.url))
+            val cleanMime = mimeType.substringBefore(';').trim()
+            val request = DownloadManager.Request(uri)
                 .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-            if (media.mime.isNotBlank()) request.setMimeType(media.mime.substringBefore(';'))
-            val userAgent = currentWeb()?.settings?.userAgentString.orEmpty()
+            if (cleanMime.isNotBlank()) request.setMimeType(cleanMime)
+
+            val userAgent = userAgentOverride.ifBlank { currentWeb()?.settings?.userAgentString.orEmpty() }
             val referer = currentWeb()?.url.orEmpty()
-            val cookie = runCatching { CookieManager.getInstance().getCookie(media.url) }.getOrNull().orEmpty()
+            val cookie = runCatching { CookieManager.getInstance().getCookie(url) }.getOrNull().orEmpty()
             if (userAgent.isNotBlank()) request.addRequestHeader("User-Agent", userAgent)
             if (referer.startsWith("http://") || referer.startsWith("https://")) {
                 request.addRequestHeader("Referer", referer)
             }
             if (cookie.isNotBlank()) request.addRequestHeader("Cookie", cookie)
-            val name = runCatching { Uri.parse(media.url).lastPathSegment.orEmpty() }.getOrDefault("")
-            if (name.isNotBlank()) request.setTitle(name.take(120))
+
+            val guessedName = suggestedName.ifBlank {
+                URLUtil.guessFileName(
+                    url,
+                    contentDisposition.takeIf { it.isNotBlank() },
+                    cleanMime.takeIf { it.isNotBlank() }
+                )
+            }
+            val safeTitle = guessedName
+                .replace(Regex("""[\\/\u0000-\u001F]"""), "_")
+                .trim()
+                .take(120)
+            request.setTitle(safeTitle.ifBlank { displayHost(url) })
+            request.setDescription("来自 ${displayHost(url)}")
             (getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(request)
-            toast(if (media.kind == "playlist") "已下载流媒体清单" else "已加入下载队列")
+            toast(successMessage)
         } catch (e: Exception) {
             toast("下载失败：${e.message}")
         }
     }
 
+    private data class PageResource(
+        val url: String,
+        val kind: String,
+        val source: String,
+        val mime: String,
+        val bytes: Long
+    )
+
     private fun pageResources() {
-        val wv = currentWeb() ?: return
-        wv.evaluateJavascript(
-            "(function(){var out=[];document.querySelectorAll('img[src],script[src],link[href]').forEach(function(e){var u=e.src||e.href;if(u&&u.indexOf('data:')!==0)out.push(u);});return JSON.stringify(out.slice(0,60));})()"
-        ) { raw ->
-            val list = try {
-                val arr = decodeJsArray(raw)
-                (0 until arr.length()).map { arr.getString(it) }
-            } catch (e: Exception) {
-                emptyList()
-            }
-            runOnUiThread {
-                if (list.isEmpty()) {
-                    showBrowserSheet("页面资源", "图片、脚本与样式资源") { content, _ ->
-                        content.addView(emptyPanel(R.drawable.ic_folder, "未发现页面资源", "当前页面没有可列出的外部资源"))
-                    }
-                } else {
-                    showUrlListDialog("页面资源", list)
+        val wv = currentWeb() ?: return toast("当前没有可分析的页面")
+        wv.evaluateJavascript(PAGE_RESOURCES_JS) { raw ->
+            val arr = decodeJsArray(raw)
+            val resources = buildList {
+                for (index in 0 until arr.length()) {
+                    val item = arr.optJSONObject(index) ?: continue
+                    val url = item.optString("url")
+                    if (url.isBlank()) continue
+                    add(
+                        PageResource(
+                            url = url,
+                            kind = item.optString("kind").ifBlank { "other" },
+                            source = item.optString("source"),
+                            mime = item.optString("mime"),
+                            bytes = item.optLong("bytes").coerceAtLeast(0)
+                        )
+                    )
                 }
+            }
+            runOnUiThread { showPageResources(resources) }
+        }
+    }
+
+    private fun showPageResources(resources: List<PageResource>) {
+        val counts = resources.groupingBy { it.kind }.eachCount()
+        val summary = buildList {
+            counts["image"]?.takeIf { it > 0 }?.let { add("图片 $it") }
+            counts["script"]?.takeIf { it > 0 }?.let { add("脚本 $it") }
+            counts["style"]?.takeIf { it > 0 }?.let { add("样式 $it") }
+            counts["media"]?.takeIf { it > 0 }?.let { add("媒体 $it") }
+            counts["font"]?.takeIf { it > 0 }?.let { add("字体 $it") }
+        }.joinToString(" · ")
+        showBrowserSheet(
+            title = "页面资源",
+            subtitle = if (resources.isEmpty()) "未识别到可用的外部资源" else "${resources.size} 个 · ${summary.ifBlank { "其他资源" }}",
+            headerActionLabel = "重新扫描",
+            headerAction = { dialog ->
+                dialog.dismiss()
+                pageResources()
+            }
+        ) { content, _ ->
+            if (resources.isEmpty()) {
+                content.addView(emptyPanel(R.drawable.ic_folder, "未发现页面资源", "滚动或操作页面后重新扫描，可发现懒加载资源"))
+                return@showBrowserSheet
+            }
+            content.addView(panelRow(
+                R.drawable.ic_info,
+                "资源已自动分类与去重",
+                "结合 DOM 与 Performance 信息显示类型、来源、大小和 MIME；点击资源可打开、下载或复制"
+            ))
+            resources.forEach { resource ->
+                content.addView(panelRow(
+                    iconRes = resourceIcon(resource.kind),
+                    title = resourceDisplayTitle(resource),
+                    subtitle = resourceDisplaySubtitle(resource),
+                    onClick = { showResourceActions(resource) }
+                ))
             }
         }
     }
 
-    private fun showUrlListDialog(title: String, urls: List<String>) {
-        showBrowserSheet(title, "${urls.size} 个资源 · 点击选择操作") { content, sheet ->
-            urls.forEach { url ->
-                content.addView(panelRow(R.drawable.ic_link, displayHost(url), url.take(120), onClick = {
-                AlertDialog.Builder(this)
-                    .setTitle("操作")
-                    .setItems(arrayOf("在当前标签打开", "下载资源", "复制链接")) { actionDialog, op ->
-                        when (op) {
-                            0 -> {
-                                currentWeb()?.loadUrl(url)
-                                sheet.dismiss()
-                            }
-                            1 -> {
-                                try {
-                                    val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-                                    val req = DownloadManager.Request(Uri.parse(url))
-                                    req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                                    dm.enqueue(req)
-                                    toast("已加入下载队列")
-                                } catch (e: Exception) {
-                                    toast("下载失败：${e.message}")
-                                }
-                            }
-                            2 -> copyText(url)
-                        }
-                        actionDialog.dismiss()
-                    }
-                    .show()
-                }))
-            }
+    private fun resourceIcon(kind: String): Int = when (kind) {
+        "image" -> R.drawable.ic_image
+        "script" -> R.drawable.ic_code
+        "style", "font" -> R.drawable.ic_font
+        "media" -> R.drawable.ic_movie
+        else -> R.drawable.ic_link
+    }
+
+    private fun resourceKindLabel(kind: String): String = when (kind) {
+        "image" -> "图片"
+        "script" -> "脚本"
+        "style" -> "样式"
+        "font" -> "字体"
+        "media" -> "媒体"
+        else -> "资源"
+    }
+
+    private fun resourceDisplayTitle(resource: PageResource): String {
+        val name = runCatching { Uri.parse(resource.url).lastPathSegment.orEmpty() }
+            .getOrDefault("")
+            .substringBefore('?')
+            .take(52)
+            .ifBlank { displayHost(resource.url) }
+        val format = resourceFormat(resource)
+        return buildList {
+            add(resourceKindLabel(resource.kind))
+            if (format.isNotBlank()) add(format)
+            add(name)
+        }.joinToString(" · ")
+    }
+
+    private fun resourceDisplaySubtitle(resource: PageResource): String = buildList {
+        add(displayHost(resource.url))
+        if (resource.source.isNotBlank()) add(resource.source)
+        if (resource.bytes > 0) add(formatBytes(resource.bytes))
+        if (resource.mime.isNotBlank()) add(resource.mime.substringBefore(';').take(48))
+    }.joinToString(" · ")
+
+    private fun resourceFormat(resource: PageResource): String {
+        val path = runCatching { Uri.parse(resource.url).path.orEmpty() }.getOrDefault("")
+        val ext = path.substringAfterLast('.', "").takeIf { it.length in 1..6 }
+        if (ext != null) return ext.uppercase(Locale.ROOT)
+        return resource.mime.substringAfter('/', "").substringBefore(';').substringBefore('+')
+            .take(10).uppercase(Locale.ROOT)
+    }
+
+    private fun showResourceActions(resource: PageResource) {
+        val downloadable = resource.url.startsWith("http://", true) || resource.url.startsWith("https://", true)
+        val actions = mutableListOf<String>()
+        if (downloadable) {
+            actions += "新标签打开"
+            actions += "下载资源"
         }
+        actions += "复制链接"
+        actions += "复制资源信息"
+        AlertDialog.Builder(this)
+            .setTitle(resourceDisplayTitle(resource))
+            .setItems(actions.toTypedArray()) { dialog, which ->
+                when (actions[which]) {
+                    "新标签打开" -> newTab(resource.url)
+                    "下载资源" -> enqueueDownload(
+                        url = resource.url,
+                        mimeType = resource.mime,
+                        suggestedName = runCatching { Uri.parse(resource.url).lastPathSegment.orEmpty() }.getOrDefault("")
+                    )
+                    "复制链接" -> copyText(resource.url)
+                    "复制资源信息" -> copyText("${resourceDisplayTitle(resource)}\n${resourceDisplaySubtitle(resource)}\n${resource.url}")
+                }
+                dialog.dismiss()
+            }
+            .show()
     }
 
     // ==================== 语音播报 ====================
@@ -1864,19 +2019,42 @@ class MainActivity : AppCompatActivity() {
     private fun showConsoleLog() {
         val logs = synchronized(consoleLogs) { consoleLogs.takeLast(120).reversed() }
         val errors = logs.count { it.optString("type") == "error" }
-        showBrowserSheet("Console", "${logs.size} 条最近日志 · $errors 条错误") { content, _ ->
+        showBrowserSheet(
+            "Console",
+            "${logs.size} 条最近日志 · $errors 条错误",
+            headerActionLabel = if (logs.isEmpty()) null else "清空",
+            headerAction = if (logs.isEmpty()) null else { dialog ->
+                synchronized(consoleLogs) { consoleLogs.clear() }
+                statusBar.text = buildStatusText()
+                dialog.dismiss()
+                toast("Console 日志已清空")
+            }
+        ) { content, _ ->
             if (logs.isEmpty()) {
                 content.addView(emptyPanel(R.drawable.ic_code, "暂无 Console 日志", "页面脚本输出会显示在这里"))
             }
             logs.forEach { entry ->
                 val type = entry.optString("type").ifEmpty { "log" }.uppercase(Locale.ROOT)
                 val message = entry.optString("text")
+                val host = displayHost(entry.optString("url"))
+                val line = entry.optInt("line")
                 content.addView(panelRow(
                     R.drawable.ic_code,
-                    type,
-                    message.take(180),
+                    buildList {
+                        add(type)
+                        if (host.isNotBlank()) add(host)
+                        if (line > 0) add("L$line")
+                    }.joinToString(" · "),
+                    message.take(220),
                     selected = type == "ERROR",
-                    onClick = { copyText(message) }
+                    onClick = {
+                        val source = entry.optString("source")
+                        copyText(buildString {
+                            append(message)
+                            if (source.isNotBlank()) append("\n").append(source)
+                            if (line > 0) append(":").append(line)
+                        })
+                    }
                 ))
             }
         }
@@ -2320,9 +2498,7 @@ class MainActivity : AppCompatActivity() {
             subtitle = if (history.isEmpty()) "最近访问的网页会显示在这里" else "最近 ${history.size} 条访问记录",
             headerActionLabel = if (history.isEmpty()) null else "清空",
             headerAction = if (history.isEmpty()) null else { dialog ->
-                settings.clearHistory()
-                toast("历史已清空")
-                dialog.dismiss()
+                confirmClearHistory(dialog)
             }
         ) { content, dialog ->
             if (history.isEmpty()) {
@@ -2333,6 +2509,13 @@ class MainActivity : AppCompatActivity() {
                     R.drawable.ic_history,
                     title.ifEmpty { displayHost(url) }.take(72),
                     displayHost(url),
+                    trailingIcon = R.drawable.ic_delete,
+                    onTrailing = {
+                        settings.removeHistory(url)
+                        toast("已删除这条历史记录")
+                        dialog.dismiss()
+                        showHistory()
+                    },
                     onClick = {
                         currentWeb()?.loadUrl(url)
                         dialog.dismiss()
@@ -2342,12 +2525,25 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun confirmClearHistory(parentSheet: BottomSheetDialog) {
+        AlertDialog.Builder(this)
+            .setTitle("清空浏览历史？")
+            .setMessage("将删除本机保存的 ${settings.getHistory().size} 条访问记录，此操作不会删除书签或下载内容。")
+            .setNegativeButton("取消", null)
+            .setPositiveButton("清空") { _, _ ->
+                settings.clearHistory()
+                parentSheet.dismiss()
+                toast("浏览历史已清空")
+            }
+            .show()
+    }
+
     private fun showAbout() {
         val api = apiBaseUrl()
         val token = settings.apiToken
         val ua = currentWeb()?.settings?.userAgentString ?: ""
-        showBrowserSheet("BrowserDiag", "安全浏览 + 页面诊断 · v3.2.0") { content, _ ->
-            content.addView(panelRow(R.drawable.ic_info, "BrowserDiag 3.2.0", "Android 浏览器与诊断后端"))
+        showBrowserSheet("BrowserDiag", "安全浏览 + 页面诊断 · v3.3.0") { content, _ ->
+            content.addView(panelRow(R.drawable.ic_info, "BrowserDiag 3.3.0", "Android 浏览器与诊断后端"))
             content.addView(panelRow(R.drawable.ic_network, "HTTP API", "$api · Token 认证", onClick = {
                 copyText(api)
             }))
@@ -2536,31 +2732,96 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 网络日志面板：读取 window.__bdNet 展示请求列表 */
+    /** 网络日志面板：把 XHR / fetch 请求转换为可读的状态、类型、大小与耗时。 */
     private fun showNetLog() {
         val wv = currentWeb() ?: return toast("无页面")
-        wv.evaluateJavascript("JSON.stringify((window.__bdNet||[]).slice(-100).reverse())") { raw ->
+        wv.evaluateJavascript("JSON.stringify((window.__bdNet||[]).slice(-140).reverse())") { raw ->
             val arr = decodeJsArray(raw)
-            showBrowserSheet("网络日志", "当前页面最近 ${arr.length()} 条请求 · 点击复制 URL") { content, _ ->
+            var successCount = 0
+            var errorCount = 0
+            var totalBytes = 0L
+            for (index in 0 until arr.length()) {
+                val item = arr.optJSONObject(index) ?: continue
+                val status = item.optInt("status")
+                if (status in 200..399) successCount++ else if (status == 0 || status >= 400) errorCount++
+                totalBytes += item.optLong("bytes").coerceAtLeast(0)
+            }
+            val summary = buildList {
+                add("${arr.length()} 条")
+                if (successCount > 0) add("成功 $successCount")
+                if (errorCount > 0) add("异常 $errorCount")
+                if (totalBytes > 0) add(formatBytes(totalBytes))
+            }.joinToString(" · ")
+            showBrowserSheet(
+                title = "网络日志",
+                subtitle = if (arr.length() == 0) "XHR / Fetch 请求诊断" else summary,
+                headerActionLabel = if (arr.length() == 0) null else "清空",
+                headerAction = if (arr.length() == 0) null else { dialog ->
+                    wv.evaluateJavascript("window.__bdNet=[];true") { }
+                    dialog.dismiss()
+                    toast("网络日志已清空")
+                }
+            ) { content, _ ->
                 if (arr.length() == 0) {
                     content.addView(emptyPanel(R.drawable.ic_network, "暂无网络记录", "刷新或浏览页面后再查看请求"))
+                    return@showBrowserSheet
                 }
                 for (idx in 0 until arr.length()) {
                     val o = arr.optJSONObject(idx) ?: continue
                     val status = o.optInt("status")
-                    val method = o.optString("method").ifEmpty { "GET" }
-                    val state = when {
-                        status in 200..399 -> "$method $status · 成功"
-                        status == 0 -> "$method · 进行中或失败"
-                        else -> "$method $status · 异常"
-                    }
-                    val url = o.optString("url")
-                    content.addView(panelRow(R.drawable.ic_network, state, url.take(140), onClick = {
-                        copyText(url)
-                    }))
+                    content.addView(panelRow(
+                        iconRes = if (status == 0 || status >= 400) R.drawable.ic_info else R.drawable.ic_network,
+                        title = networkEntryTitle(o),
+                        subtitle = networkEntrySubtitle(o),
+                        selected = status == 0 || status >= 400,
+                        onClick = { showNetworkEntryActions(o) }
+                    ))
                 }
             }
         }
+    }
+
+    private fun networkEntryTitle(entry: JSONObject): String {
+        val method = entry.optString("method").ifEmpty { "GET" }.uppercase(Locale.ROOT)
+        val status = entry.optInt("status")
+        val type = entry.optString("type").ifEmpty { "request" }.uppercase(Locale.ROOT)
+        val host = displayHost(entry.optString("url"))
+        return "$method ${if (status > 0) status else "ERR"} · $type · $host"
+    }
+
+    private fun networkEntrySubtitle(entry: JSONObject): String = buildList {
+        val url = entry.optString("url")
+        val path = runCatching { Uri.parse(url).encodedPath.orEmpty() }.getOrDefault("")
+        if (path.isNotBlank() && path != "/") add(path.take(72))
+        val mime = entry.optString("mime").substringBefore(';')
+        if (mime.isNotBlank()) add(mime.take(42))
+        val bytes = entry.optLong("bytes")
+        if (bytes > 0) add(formatBytes(bytes))
+        val duration = entry.optDouble("duration")
+        if (duration > 0) add("${duration.toLong()} ms")
+        if (isEmpty()) add(compactUrl(url).take(120))
+    }.joinToString(" · ")
+
+    private fun showNetworkEntryActions(entry: JSONObject) {
+        val url = entry.optString("url")
+        val webUrl = url.startsWith("http://", true) || url.startsWith("https://", true)
+        val actions = mutableListOf<String>()
+        if (webUrl) actions += "新标签打开"
+        actions += "复制 URL"
+        actions += "复制请求信息"
+        AlertDialog.Builder(this)
+            .setTitle(networkEntryTitle(entry))
+            .setItems(actions.toTypedArray()) { dialog, which ->
+                when (actions[which]) {
+                    "新标签打开" -> newTab(url)
+                    "复制 URL" -> copyText(url)
+                    "复制请求信息" -> copyText(
+                        "${networkEntryTitle(entry)}\n${networkEntrySubtitle(entry)}\n$url"
+                    )
+                }
+                dialog.dismiss()
+            }
+            .show()
     }
 
     /** WebView 会把 JavaScript 字符串结果再编码一层；兼容 JSON.stringify(...) 的双层返回值。 */
@@ -2577,7 +2838,17 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 下载管理：列出系统 DownloadManager 的下载记录，点击打开 */
+    private data class DownloadEntry(
+        val id: Long,
+        val title: String,
+        val sourceUrl: String,
+        val status: Int,
+        val downloadedBytes: Long,
+        val totalBytes: Long,
+        val reason: Int
+    )
+
+    /** 下载管理：显示实时状态/进度；完成项可直接打开，其余跳转系统下载管理继续处理。 */
     private fun showDownloads() {
         val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
         val q = DownloadManager.Query()
@@ -2589,56 +2860,105 @@ class MainActivity : AppCompatActivity() {
         val cursor: Cursor? = try { dm.query(q) } catch (e: Exception) { null }
         if (cursor == null || !cursor.moveToFirst()) {
             cursor?.close()
-            showBrowserSheet("下载内容", "系统 DownloadManager") { content, _ ->
+            showBrowserSheet(
+                "下载内容",
+                "系统 DownloadManager",
+                headerActionLabel = "系统下载",
+                headerAction = { openSystemDownloads() }
+            ) { content, _ ->
                 content.addView(emptyPanel(R.drawable.ic_download, "暂无下载记录", "从网页下载的文件会显示在这里"))
             }
             return
         }
-        val names = mutableListOf<String>()
-        val ids = mutableListOf<Long>()
+        val entries = mutableListOf<DownloadEntry>()
         do {
-            val id = cursor.getLong(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_ID))
-            val title = cursor.getString(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_TITLE))
-            val size = cursor.getLong(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES))
-            val status = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
-            val state = when (status) {
-                DownloadManager.STATUS_SUCCESSFUL -> "完成"
-                DownloadManager.STATUS_FAILED -> "失败"
-                DownloadManager.STATUS_PAUSED -> "暂停"
-                DownloadManager.STATUS_RUNNING -> "下载中"
-                else -> "等待"
-            }
-            val sizeText = if (size > 0) " · ${size / 1024}KB" else ""
-            names.add("$state · $title$sizeText")
-            ids.add(id)
+            entries += DownloadEntry(
+                id = cursor.getLong(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_ID)),
+                title = cursor.getString(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_TITLE)).orEmpty(),
+                sourceUrl = cursor.getString(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_URI)).orEmpty(),
+                status = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS)),
+                downloadedBytes = cursor.getLong(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)),
+                totalBytes = cursor.getLong(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)),
+                reason = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON))
+            )
         } while (cursor.moveToNext())
         cursor.close()
-        showBrowserSheet("下载内容", "${names.size} 个下载任务") { content, dialog ->
-            names.forEachIndexed { idx, label ->
-                val split = label.split(" · ", limit = 2)
-                val state = split.firstOrNull().orEmpty()
-                val title = split.getOrNull(1).orEmpty().ifEmpty { label }
-                content.addView(panelRow(R.drawable.ic_download, title, state, onClick = {
-                    val uri = dm.getUriForDownloadedFile(ids[idx])
-                    if (uri == null) {
-                        toast("该下载尚不可打开")
-                    } else {
-                        try {
-                            val mime = dm.getMimeTypeForDownloadedFile(ids[idx]) ?: "*/*"
-                            startActivity(
-                                Intent(Intent.ACTION_VIEW)
-                                    .setDataAndType(uri, mime)
-                                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                            )
-                            dialog.dismiss()
-                        } catch (_: ActivityNotFoundException) {
-                            toast("无法打开该文件")
-                        } catch (_: SecurityException) {
-                            toast("无法打开该文件")
+        val complete = entries.count { it.status == DownloadManager.STATUS_SUCCESSFUL }
+        val active = entries.count { it.status == DownloadManager.STATUS_RUNNING || it.status == DownloadManager.STATUS_PENDING }
+        val failed = entries.count { it.status == DownloadManager.STATUS_FAILED }
+        val summary = buildList {
+            add("${entries.size} 个任务")
+            if (complete > 0) add("完成 $complete")
+            if (active > 0) add("进行中 $active")
+            if (failed > 0) add("失败 $failed")
+        }.joinToString(" · ")
+        showBrowserSheet(
+            "下载内容",
+            summary,
+            headerActionLabel = "系统下载",
+            headerAction = { openSystemDownloads() }
+        ) { content, dialog ->
+            entries.forEach { entry ->
+                content.addView(panelRow(
+                    iconRes = R.drawable.ic_download,
+                    title = entry.title.ifBlank { displayHost(entry.sourceUrl) }.take(80),
+                    subtitle = downloadEntrySubtitle(entry),
+                    selected = entry.status == DownloadManager.STATUS_FAILED,
+                    onClick = {
+                        if (entry.status == DownloadManager.STATUS_SUCCESSFUL) {
+                            openDownloadedFile(dm, entry.id, dialog)
+                        } else {
+                            openSystemDownloads()
                         }
                     }
-                }))
+                ))
             }
+        }
+    }
+
+    private fun downloadEntrySubtitle(entry: DownloadEntry): String = buildList {
+        val state = when (entry.status) {
+            DownloadManager.STATUS_SUCCESSFUL -> "已完成"
+            DownloadManager.STATUS_FAILED -> "下载失败${if (entry.reason > 0) " (${entry.reason})" else ""}"
+            DownloadManager.STATUS_PAUSED -> "已暂停"
+            DownloadManager.STATUS_RUNNING -> if (entry.totalBytes > 0) {
+                val percent = (entry.downloadedBytes * 100 / entry.totalBytes).coerceIn(0, 100)
+                "下载中 $percent%"
+            } else "下载中"
+            else -> "等待下载"
+        }
+        add(state)
+        if (entry.downloadedBytes > 0) {
+            add(
+                if (entry.totalBytes > 0) "${formatBytes(entry.downloadedBytes)} / ${formatBytes(entry.totalBytes)}"
+                else formatBytes(entry.downloadedBytes)
+            )
+        } else if (entry.totalBytes > 0) {
+            add(formatBytes(entry.totalBytes))
+        }
+        displayHost(entry.sourceUrl).takeIf { it.isNotBlank() }?.let { add(it) }
+    }.joinToString(" · ")
+
+    private fun openDownloadedFile(dm: DownloadManager, id: Long, parent: BottomSheetDialog) {
+        val uri = dm.getUriForDownloadedFile(id) ?: return toast("下载文件已不存在")
+        try {
+            val mime = dm.getMimeTypeForDownloadedFile(id) ?: "*/*"
+            startActivity(
+                Intent(Intent.ACTION_VIEW)
+                    .setDataAndType(uri, mime)
+                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            )
+            parent.dismiss()
+        } catch (_: Exception) {
+            toast("没有可打开该文件的应用")
+        }
+    }
+
+    private fun openSystemDownloads() {
+        try {
+            startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS))
+        } catch (_: ActivityNotFoundException) {
+            toast("系统下载管理器不可用")
         }
     }
 
@@ -2898,6 +3218,94 @@ class MainActivity : AppCompatActivity() {
             "revcontent.com", "popads.net", "propellerads.com", "adsterra.com"
         )
 
+        /** DOM + Resource Timing 双来源资源盘点，避免“页面资源”退化成无法辨认的 URL 列表。 */
+        private val PAGE_RESOURCES_JS = """
+            (function(){
+              var map = Object.create(null);
+              var priority = {media:6, script:5, style:4, image:3, font:2, other:1};
+              function absoluteUrl(value) {
+                if (!value) return '';
+                var raw = String(value);
+                if (raw.indexOf('data:') === 0) return '';
+                try { return new URL(raw, document.baseURI).href; } catch (_) { return raw; }
+              }
+              function extensionOf(url) {
+                var clean = String(url).split('#')[0].split('?')[0].toLowerCase();
+                var index = clean.lastIndexOf('.');
+                return index >= 0 ? clean.slice(index + 1) : '';
+              }
+              function guessKind(url, mime, initiator) {
+                var ext = extensionOf(url);
+                var type = String(mime || '').toLowerCase();
+                var init = String(initiator || '').toLowerCase();
+                if (type.indexOf('image/') === 0 || ['png','jpg','jpeg','gif','webp','avif','svg','ico','bmp'].indexOf(ext) >= 0 || init === 'img') return 'image';
+                if (type.indexOf('javascript') >= 0 || ['js','mjs','cjs'].indexOf(ext) >= 0 || init === 'script') return 'script';
+                if (type.indexOf('font/') === 0 || ['woff','woff2','ttf','otf','eot'].indexOf(ext) >= 0) return 'font';
+                if (type.indexOf('text/css') >= 0 || ext === 'css' || init === 'css') return 'style';
+                if (type.indexOf('video/') === 0 || type.indexOf('audio/') === 0 || ['mp4','webm','m3u8','mpd','mp3','m4a','aac','ogg','wav','flac'].indexOf(ext) >= 0 || init === 'video' || init === 'audio') return 'media';
+                return 'other';
+              }
+              function add(url, kind, source, mime, bytes) {
+                var resolved = absoluteUrl(url);
+                if (!resolved) return;
+                var detected = kind || guessKind(resolved, mime, source);
+                var item = map[resolved];
+                if (!item) {
+                  map[resolved] = {
+                    url: resolved,
+                    kind: detected,
+                    source: source || '',
+                    mime: mime || '',
+                    bytes: Number(bytes) || 0
+                  };
+                  return;
+                }
+                if ((priority[detected] || 0) > (priority[item.kind] || 0)) item.kind = detected;
+                if (source && item.source.split(' · ').indexOf(source) < 0) item.source += (item.source ? ' · ' : '') + source;
+                if (!item.mime && mime) item.mime = mime;
+                item.bytes = Math.max(item.bytes || 0, Number(bytes) || 0);
+              }
+
+              document.querySelectorAll('img[src],script[src],link[href],source[src],video[src],audio[src]').forEach(function(el){
+                var tag = el.tagName.toLowerCase();
+                var url = el.currentSrc || el.src || el.href || '';
+                var kind = '';
+                var source = 'DOM ' + tag;
+                if (tag === 'img') kind = 'image';
+                else if (tag === 'script') kind = 'script';
+                else if (tag === 'video' || tag === 'audio' || tag === 'source') kind = 'media';
+                else if (tag === 'link') {
+                  var rel = String(el.rel || '').toLowerCase();
+                  var asType = String(el.as || '').toLowerCase();
+                  if (rel.indexOf('stylesheet') >= 0 || asType === 'style') kind = 'style';
+                  else if (rel.indexOf('icon') >= 0 || asType === 'image') kind = 'image';
+                  else if (asType === 'font') kind = 'font';
+                  else if (asType === 'script') kind = 'script';
+                }
+                add(url, kind, source, el.type || '', 0);
+              });
+
+              try {
+                performance.getEntriesByType('resource').forEach(function(entry){
+                  add(
+                    entry.name,
+                    guessKind(entry.name, '', entry.initiatorType),
+                    'Performance ' + (entry.initiatorType || 'resource'),
+                    '',
+                    entry.encodedBodySize || entry.transferSize || 0
+                  );
+                });
+              } catch (_) {}
+
+              var out = Object.keys(map).map(function(key){ return map[key]; });
+              out.sort(function(a,b){
+                var kindDiff = (priority[b.kind] || 0) - (priority[a.kind] || 0);
+                return kindDiff || ((b.bytes || 0) - (a.bytes || 0));
+              });
+              return JSON.stringify(out.slice(0, 140));
+            })()
+        """.trimIndent()
+
         private val MEDIA_SNIFF_JS = """
             (function(){
               var map = Object.create(null);
@@ -3027,7 +3435,7 @@ class MainActivity : AppCompatActivity() {
               if (window.__bdHooked) return;
               window.__bdHooked = true;
               window.__bdNet = [];
-              function record(u,m,s,t,mime,bytes){
+              function record(u,m,s,t,mime,bytes,duration){
                 window.__bdNet.push({
                   url:String(u).slice(0,4096),
                   method:m,
@@ -3035,6 +3443,7 @@ class MainActivity : AppCompatActivity() {
                   type:t,
                   mime:String(mime || '').slice(0,160),
                   bytes:Number(bytes) || 0,
+                  duration:Math.max(0,Math.round(Number(duration) || 0)),
                   ts:Date.now()
                 });
                 if(window.__bdNet.length>300) window.__bdNet.shift();
@@ -3044,17 +3453,26 @@ class MainActivity : AppCompatActivity() {
               var sp = XMLHttpRequest.prototype.send;
               XMLHttpRequest.prototype.open = function(m,u){ this.__u=u; this.__m=m; return op.apply(this,arguments); };
               XMLHttpRequest.prototype.send = function(){
-                this.addEventListener('load', function(){
+                var xhr = this;
+                var start = performance.now();
+                var recorded = false;
+                function finish(){
+                  if (recorded) return;
+                  recorded = true;
                   record(
-                    this.responseURL || this.__u,
-                    this.__m,
-                    this.status,
+                    xhr.responseURL || xhr.__u,
+                    xhr.__m,
+                    xhr.status,
                     'xhr',
-                    this.getResponseHeader('content-type') || '',
-                    this.getResponseHeader('content-length') || 0
+                    xhr.getResponseHeader('content-type') || '',
+                    xhr.getResponseHeader('content-length') || 0,
+                    performance.now() - start
                   );
-                });
-                this.addEventListener('error', function(){ record(this.__u,this.__m,0,'xhr','',''); });
+                }
+                this.addEventListener('load', finish);
+                this.addEventListener('error', finish);
+                this.addEventListener('abort', finish);
+                this.addEventListener('timeout', finish);
                 return sp.apply(this,arguments);
               };
               var of = window.fetch;
@@ -3062,6 +3480,7 @@ class MainActivity : AppCompatActivity() {
                 var u = arguments[0];
                 var init = arguments[1] || {};
                 var method = String(init.method || (u && u.method) || 'GET').toUpperCase();
+                var start = performance.now();
                 return of.apply(this,arguments).then(function(r){
                   record(
                     r.url || urlOf(u),
@@ -3069,10 +3488,11 @@ class MainActivity : AppCompatActivity() {
                     r.status,
                     'fetch',
                     r.headers.get('content-type') || '',
-                    r.headers.get('content-length') || 0
+                    r.headers.get('content-length') || 0,
+                    performance.now() - start
                   );
                   return r;
-                }).catch(function(e){ record(urlOf(u),method,0,'fetch','',''); throw e; });
+                }).catch(function(e){ record(urlOf(u),method,0,'fetch','','',performance.now() - start); throw e; });
               };
             })();
         """.trimIndent()
