@@ -114,8 +114,8 @@ jobs:
               --title "BrowserDiag ${VERSION}" \
               --notes "Automated signed release build (commit ${GITHUB_SHA:0:7}).
 
-- 由 GitHub Actions 自动构建并签名（BROWSERDIAG release keystore）
-- 安装前请先卸载旧版本（包名 com.browserdiag.app 相同）
-- 支持 MCP stdio / CLI / HTTP 三种模式，Android 内置 WebView 浏览器诊断 + 28 个 MCP 工具"
+          - 由 GitHub Actions 自动构建并签名（BROWSERDIAG release keystore）
+          - 安装前请先卸载旧版本（包名 com.browserdiag.app 相同）
+          - 支持 MCP stdio / CLI / HTTP 三种模式，Android 内置 WebView 浏览器诊断 + 28 个 MCP 工具"
           fi
           gh release view "$TAG" --json tagName,name,assets --jq '.tagName + " | " + .name + " | assets: " + ([.assets[].name] | join(","))'
