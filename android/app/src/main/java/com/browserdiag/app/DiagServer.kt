@@ -31,6 +31,8 @@ class DiagServer(
     private val getConsoleLogs: () -> List<JSONObject>,
     private val getSettings: () -> Settings,
     private val getTabs: () -> Tabs?,
+    private val getNetworkRuleStore: () -> NetworkRuleStore,
+    private val onNetworkRulesChanged: () -> Unit,
     private val apiToken: String,
 ) : NanoHTTPD(listenHost, port) {
 
@@ -87,6 +89,7 @@ class DiagServer(
                 "browser_bookmarks" -> bookmarks(params)
                 "browser_http" -> httpRequest(params)
                 "browser_netlog" -> netlog()
+                "browser_network_rules" -> networkRuleTool(params)
                 "browser_close" -> close()
                 else -> JSONObject().put("error", "unknown tool: $tool")
             }
@@ -101,7 +104,7 @@ class DiagServer(
         "browser_eval", "browser_screenshot", "browser_perf", "browser_report",
         "browser_source", "browser_tabs", "browser_text", "browser_interactive",
         "browser_history", "browser_bookmarks", "browser_http", "browser_netlog",
-        "browser_close"
+        "browser_network_rules", "browser_close"
     )
 
     /** 获取当前页面 HTML 源码（供 AI 分析与后续开发） */
@@ -432,7 +435,7 @@ class DiagServer(
             val timeout = params.optInt("timeoutMs", 10000).coerceIn(1000, 30000)
             conn.connectTimeout = timeout
             conn.readTimeout = timeout
-            conn.setRequestProperty("User-Agent", "BrowserDiag/3.3")
+            conn.setRequestProperty("User-Agent", "BrowserDiag/3.4")
             conn.setRequestProperty("Accept", "*/*")
             // 附加请求头（JSON 对象）
             val headers = params.optJSONObject("headers")
@@ -465,6 +468,124 @@ class DiagServer(
     private fun netlog(): JSONObject {
         val arr = evalArray("JSON.stringify((window.__bdNet||[]).slice(-200))")
         return JSONObject().put("count", arr.length()).put("logs", arr)
+    }
+
+    /**
+     * 网络实验室规则管理。operation: list | hits | add | update | enable | delete | clear_hits。
+     * add/update 建议把规则放入 {"rule": {...}}，避免 operation 与规则 action 混淆。
+     */
+    private fun networkRuleTool(params: JSONObject): JSONObject {
+        val store = getNetworkRuleStore()
+        val operation = params.optString("operation", params.optString("op", "list"))
+            .trim().lowercase()
+        return when (operation) {
+            "list" -> {
+                val rules = JSONArray()
+                store.allRules().forEach { rules.put(it.toJson()) }
+                JSONObject()
+                    .put("count", rules.length())
+                    .put("enabled", store.allRules().count { it.enabled })
+                    .put("rules", rules)
+                    .put("operations", JSONArray(listOf("list", "hits", "add", "update", "enable", "delete", "clear_hits")))
+            }
+            "hits" -> {
+                val limit = params.optInt("limit", 100).coerceIn(1, 200)
+                val nativeHits = store.recentHits(limit)
+                val jsHits = evalArray("JSON.stringify((window.__bdRuleHits||[]).slice(-$limit).reverse())")
+                val merged = mutableListOf<JSONObject>()
+                for (index in 0 until nativeHits.length()) nativeHits.optJSONObject(index)?.let { merged += it }
+                for (index in 0 until jsHits.length()) jsHits.optJSONObject(index)?.let { merged += it }
+                val hits = JSONArray()
+                merged.sortedByDescending { it.optLong("ts") }.take(limit).forEach { hits.put(it) }
+                JSONObject()
+                    .put("count", hits.length())
+                    .put("hits", hits)
+                    .put("nativeCount", nativeHits.length())
+                    .put("pageJsCount", jsHits.length())
+            }
+            "add" -> {
+                val payload = params.optJSONObject("rule") ?: params
+                val rule = networkRuleFromPayload(payload, null)
+                    ?: return JSONObject().put("error", "valid rule.action required")
+                val saved = runCatching { store.upsert(rule) }.getOrElse { error ->
+                    return JSONObject().put("error", error.message ?: "invalid network rule")
+                }
+                onNetworkRulesChanged()
+                JSONObject().put("added", true).put("rule", saved.toJson())
+            }
+            "update" -> {
+                val payload = params.optJSONObject("rule") ?: params
+                val id = payload.optString("id", params.optString("id")).trim()
+                if (id.isEmpty()) return JSONObject().put("error", "rule id required")
+                val existing = store.findRule(id)
+                    ?: return JSONObject().put("error", "network rule not found")
+                val rule = networkRuleFromPayload(payload, existing)?.copy(id = id)
+                    ?: return JSONObject().put("error", "valid rule.action required")
+                val saved = runCatching { store.upsert(rule) }.getOrElse { error ->
+                    return JSONObject().put("error", error.message ?: "invalid network rule")
+                }
+                onNetworkRulesChanged()
+                JSONObject().put("updated", true).put("rule", saved.toJson())
+            }
+            "enable" -> {
+                val id = params.optString("id").trim()
+                if (id.isEmpty()) return JSONObject().put("error", "rule id required")
+                val enabled = params.optBoolean("enabled", true)
+                val saved = store.setEnabled(id, enabled)
+                    ?: return JSONObject().put("error", "network rule not found")
+                onNetworkRulesChanged()
+                JSONObject().put("updated", true).put("rule", saved.toJson())
+            }
+            "delete" -> {
+                val id = params.optString("id").trim()
+                if (id.isEmpty()) return JSONObject().put("error", "rule id required")
+                val deleted = store.remove(id)
+                if (deleted) onNetworkRulesChanged()
+                JSONObject().put("deleted", deleted).put("id", id)
+            }
+            "clear_hits" -> {
+                store.clearHits()
+                evalJs("window.__bdRuleHits=[];true", timeoutSec = 3)
+                JSONObject().put("cleared", true)
+            }
+            else -> JSONObject()
+                .put("error", "unsupported operation: $operation")
+                .put("operations", JSONArray(listOf("list", "hits", "add", "update", "enable", "delete", "clear_hits")))
+        }
+    }
+
+    private fun networkRuleFromPayload(payload: JSONObject, existing: NetworkRule?): NetworkRule? {
+        val actionKey = if (payload.has("action")) payload.optString("action") else existing?.action?.key
+        val action = NetworkRuleAction.fromKey(actionKey) ?: return null
+        val headers = if (payload.has("headers")) {
+            when (val raw = payload.opt("headers")) {
+                is JSONObject -> buildMap {
+                    val keys = raw.keys()
+                    while (keys.hasNext()) {
+                        val key = keys.next()
+                        put(key, raw.optString(key))
+                    }
+                }
+                is String -> parseNetworkHeaders(raw)
+                else -> emptyMap()
+            }
+        } else existing?.headers ?: emptyMap()
+        val id = payload.optString("id", existing?.id ?: "nr_${System.currentTimeMillis()}")
+        return NetworkRule(
+            id = id,
+            name = payload.optString("name", existing?.name ?: action.label),
+            enabled = if (payload.has("enabled")) payload.optBoolean("enabled") else existing?.enabled ?: true,
+            priority = if (payload.has("priority")) payload.optInt("priority") else existing?.priority ?: 100,
+            urlPattern = payload.optString("urlPattern", existing?.urlPattern ?: "*"),
+            methods = payload.optString("methods", existing?.methods ?: "*"),
+            action = action,
+            value = payload.optString("value", existing?.value ?: ""),
+            replacement = payload.optString("replacement", existing?.replacement ?: ""),
+            headers = headers,
+            statusCode = if (payload.has("statusCode")) payload.optInt("statusCode") else existing?.statusCode ?: 200,
+            mimeType = payload.optString("mimeType", existing?.mimeType ?: "text/plain; charset=utf-8"),
+            delayMs = if (payload.has("delayMs")) payload.optInt("delayMs") else existing?.delayMs ?: 0
+        )
     }
 
     private fun close(): JSONObject {

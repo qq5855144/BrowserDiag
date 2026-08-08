@@ -32,6 +32,8 @@ import android.view.inputmethod.InputMethodManager
 import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
 import android.webkit.DownloadListener
+import android.webkit.ServiceWorkerClient
+import android.webkit.ServiceWorkerController
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -56,6 +58,7 @@ import androidx.core.graphics.drawable.IconCompat
 import androidx.core.content.pm.ShortcutInfoCompat
 import androidx.core.content.pm.ShortcutManagerCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.webkit.ScriptHandler
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import com.google.android.material.bottomsheet.BottomSheetDialog
@@ -75,9 +78,10 @@ import java.net.NetworkInterface
 import java.net.URL
 import java.net.URLEncoder
 import java.util.Locale
+import java.util.WeakHashMap
 
 /**
- * BrowserDiag 3.3：Chrome 风格底部导航浏览器 + 带 Token 认证的内嵌 HTTP 诊断服务器。
+ * BrowserDiag 3.4：Chrome 风格底部导航浏览器 + MCP HTTP Bridge + 网络实验室。
  * 功能：多标签 / 搜索引擎切换 / UA 切换 / 深色主题 / 油猴脚本 / 书签 / 保存页面 / 分享 /
  * 页面查找 / 翻译 / 媒体嗅探 / 页面资源 / 源码 zip / 语音播报 / 二维码 / 添加到桌面 / 历史。
  * 平时可作普通浏览器使用，也可作为诊断后端供其它 AI 工具通过 HTTP 调用。
@@ -87,6 +91,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var urlInput: EditText
     private lateinit var statusBar: TextView
     private lateinit var settings: Settings
+    private lateinit var networkRules: NetworkRuleStore
     private lateinit var tabs: Tabs
     private lateinit var webContainer: FrameLayout
     private lateinit var topBar: LinearLayout
@@ -110,6 +115,7 @@ class MainActivity : AppCompatActivity() {
     private var userscriptInstallBusy = false
     private var mainMenuDialog: Dialog? = null
     private var lastExitBackPressedAt = 0L
+    private val networkScriptHandlers = WeakHashMap<WebView, MutableList<ScriptHandler>>()
 
     // Chrome / Material 3 风格调色板。手动主题与系统组件主题保持同步。
     private fun surfaceColor() = if (isDark) 0xFF202124.toInt() else 0xFFF8FAFD.toInt()
@@ -126,6 +132,7 @@ class MainActivity : AppCompatActivity() {
         installCrashHandler()
         super.onCreate(savedInstanceState)
         settings = Settings(this)
+        networkRules = NetworkRuleStore(this)
         tabs = Tabs(this)
         isDark = settings.darkMode
         theme.applyStyle(
@@ -133,6 +140,7 @@ class MainActivity : AppCompatActivity() {
             true
         )
         WebView.setWebContentsDebuggingEnabled(settings.debugWeb)
+        installServiceWorkerNetworkRules()
         applySavedOrientation()
         buildUi()
         installBackNavigation()
@@ -870,13 +878,8 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // 网络 hook + 油猴脚本（document-start）
-        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
-            try {
-                WebViewCompat.addDocumentStartJavaScript(wv, NETWORK_HOOK_JS, setOf("*"))
-            } catch (e: Exception) {
-            }
-        }
+        // 网络实验室 Hook + 油猴脚本（document-start）
+        installNetworkRuleHooks(wv)
         settings.getScripts().filter { it.enabled }.forEach { s ->
             try {
                 WebViewCompat.addDocumentStartJavaScript(
@@ -933,6 +936,13 @@ class MainActivity : AppCompatActivity() {
                 if (tab != null && tabs.current === tab) {
                     setOmniboxUrl(url.orEmpty())
                     updateChromeControls()
+                }
+                // 旧版 WebView 不支持 document-start 时仍提供降级能力；现代 WebView 在导航前已注入。
+                if (view != null && !WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                    view.evaluateJavascript(buildNetworkHookJs()) { }
+                    networkRules.enabledRules()
+                        .filter { it.action == NetworkRuleAction.INJECT_JS || it.action == NetworkRuleAction.INJECT_CSS }
+                        .forEach { rule -> view.evaluateJavascript(wrapNetworkInjectionRule(rule)) { } }
                 }
                 runOnUiThread { statusBar.text = buildStatusText() }
             }
@@ -995,6 +1005,9 @@ class MainActivity : AppCompatActivity() {
             override fun shouldInterceptRequest(
                 view: WebView?, request: WebResourceRequest?
             ): WebResourceResponse? {
+                request?.let { networkRequest ->
+                    networkRules.intercept(networkRequest)?.let { return it }
+                }
                 if (settings.adBlock && request?.url != null) {
                     val host = request.url.host?.lowercase() ?: ""
                     if (host.isNotEmpty() && AD_BLOCK_HOSTS.any { host == it || host.endsWith(".$it") }) {
@@ -1017,6 +1030,148 @@ class MainActivity : AppCompatActivity() {
                 userAgentOverride = userAgent.orEmpty()
             )
         })
+    }
+
+    /** 每个 WebView 独立注册 document-start Hook；规则更新时移除旧脚本并原位刷新。 */
+    private fun installNetworkRuleHooks(wv: WebView) {
+        if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) return
+        networkScriptHandlers.remove(wv)?.forEach { handler -> runCatching { handler.remove() } }
+        val handlers = mutableListOf<ScriptHandler>()
+        runCatching {
+            handlers += WebViewCompat.addDocumentStartJavaScript(wv, buildNetworkHookJs(), setOf("*"))
+        }
+        networkRules.enabledRules()
+            .filter { it.action == NetworkRuleAction.INJECT_JS || it.action == NetworkRuleAction.INJECT_CSS }
+            .forEach { rule ->
+                runCatching {
+                    handlers += WebViewCompat.addDocumentStartJavaScript(
+                        wv,
+                        wrapNetworkInjectionRule(rule),
+                        setOf("*")
+                    )
+                }
+            }
+        if (handlers.isNotEmpty()) networkScriptHandlers[wv] = handlers
+    }
+
+    private fun releaseNetworkRuleHooks(wv: WebView) {
+        networkScriptHandlers.remove(wv)?.forEach { handler -> runCatching { handler.remove() } }
+    }
+
+    /** Service Worker 请求不一定经过某个页面的 WebViewClient，单独接入同一套原生规则。 */
+    private fun installServiceWorkerNetworkRules() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return
+        runCatching {
+            ServiceWorkerController.getInstance().setServiceWorkerClient(object : ServiceWorkerClient() {
+                override fun shouldInterceptRequest(request: WebResourceRequest): WebResourceResponse? {
+                    networkRules.intercept(request)?.let { return it }
+                    if (settings.adBlock) {
+                        val host = request.url.host?.lowercase().orEmpty()
+                        if (host.isNotEmpty() && AD_BLOCK_HOSTS.any { host == it || host.endsWith(".$it") }) {
+                            return WebResourceResponse(
+                                "text/plain",
+                                "utf-8",
+                                java.io.ByteArrayInputStream(ByteArray(0))
+                            )
+                        }
+                    }
+                    return null
+                }
+            })
+        }
+    }
+
+    private fun buildNetworkHookJs(): String {
+        val rulesLiteral = JSONObject.quote(networkRules.rulesJsonForJs())
+        return NETWORK_HOOK_JS.replace("__BD_NETWORK_RULES_JSON__", rulesLiteral)
+    }
+
+    /**
+     * 原生规则快照立即生效；当前页面的 fetch/XHR 同步更新，document-start JS/CSS 注入从下次导航生效。
+     */
+    private fun refreshNetworkRuleHooks() {
+        val rulesLiteral = JSONObject.quote(networkRules.rulesJsonForJs())
+        val cssRules = networkRules.enabledRules().filter { it.action == NetworkRuleAction.INJECT_CSS }
+        tabs.all.forEach { tab ->
+            installNetworkRuleHooks(tab.webView)
+            tab.webView.evaluateJavascript(
+                "window.__bdSetNetworkRules&&window.__bdSetNetworkRules(JSON.parse($rulesLiteral));true"
+            ) { }
+            // CSS 是可逆注入：当前页先清掉 NetworkLab 样式，再按最新启用规则重放，保证停用/删除立即生效。
+            tab.webView.evaluateJavascript(
+                "document.querySelectorAll('style[data-browserdiag-rule]').forEach(function(e){e.remove()});true"
+            ) { }
+            cssRules.forEach { rule -> tab.webView.evaluateJavascript(wrapNetworkInjectionRule(rule)) { } }
+        }
+    }
+
+    private fun wrapNetworkInjectionRule(rule: NetworkRule): String {
+        val pattern = JSONObject.quote(rule.urlPattern)
+        val ruleId = JSONObject.quote(rule.id)
+        val ruleName = JSONObject.quote(rule.name)
+        val action = JSONObject.quote(rule.action.key)
+        val body = when (rule.action) {
+            NetworkRuleAction.INJECT_JS -> rule.value
+            NetworkRuleAction.INJECT_CSS -> {
+                val css = JSONObject.quote(rule.value)
+                """
+                (function(){
+                  var applyCss=function(){
+                    var root=document.head||document.documentElement;
+                    if(!root)return false;
+                    var old=null;
+                    document.querySelectorAll('style[data-browserdiag-rule]').forEach(function(e){
+                      if(e.getAttribute('data-browserdiag-rule')===$ruleId)old=e;
+                    });
+                    if(old)old.remove();
+                    var style=document.createElement('style');
+                    style.setAttribute('data-browserdiag-rule',$ruleId);
+                    style.textContent=$css;
+                    root.appendChild(style);
+                    return true;
+                  };
+                  if(!applyCss())document.addEventListener('DOMContentLoaded',applyCss,{once:true});
+                })();
+                """.trimIndent()
+            }
+            else -> ""
+        }
+        return buildString {
+            append(
+                """
+                (function(){
+                  var p=$pattern;
+                  var u=String(location.href);
+                  function matchPattern(pattern,url){
+                    if(!pattern||pattern==='*'||pattern==='<all_urls>')return true;
+                    try{
+                      var low=pattern.toLowerCase();
+                      if(low.indexOf('regex:')===0)return new RegExp(pattern.slice(6)).test(url);
+                      if(pattern.length>2&&pattern.charAt(0)==='/'&&pattern.charAt(pattern.length-1)==='/')return new RegExp(pattern.slice(1,-1)).test(url);
+                      var special="\\.^+?()[]{}|"+String.fromCharCode(36);
+                      var re='';
+                      for(var i=0;i<pattern.length;i++){
+                        var ch=pattern.charAt(i);
+                        if(ch==='*')re+='.*';else{if(special.indexOf(ch)>=0)re+='\\';re+=ch;}
+                      }
+                      return new RegExp('^'+re+String.fromCharCode(36),'i').test(url);
+                    }catch(_){return false;}
+                  }
+                  if(!matchPattern(p,u))return;
+                  try{
+                """.trimIndent()
+            )
+            append('\n')
+            append(body)
+            append('\n')
+            append(
+                """
+                    if(window.__bdRecordRuleHit)window.__bdRecordRuleHit({ruleId:$ruleId,ruleName:$ruleName,action:$action,url:u,phase:'inject',detail:'document-start'});
+                  }catch(e){console.error('[BrowserDiag NetworkLab]',$ruleName,e);}
+                })();
+                """.trimIndent()
+            )
+        }
     }
 
     private fun showTabsDialog() {
@@ -1075,6 +1230,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun closeTabAndKeepBrowser(tabId: Int) {
+        tabs.get(tabId)?.webView?.let(::releaseNetworkRuleHooks)
         tabs.destroy(tabId)
         if (tabs.size == 0) {
             newTab(settings.engine.homeUrl)
@@ -1092,6 +1248,7 @@ class MainActivity : AppCompatActivity() {
             .setNegativeButton("取消", null)
             .setPositiveButton("关闭全部") { _, _ ->
                 parentSheet.dismiss()
+                tabs.all.forEach { releaseNetworkRuleHooks(it.webView) }
                 tabs.destroyAll()
                 newTab(settings.engine.homeUrl)
                 toast("已关闭全部标签页")
@@ -1171,6 +1328,7 @@ class MainActivity : AppCompatActivity() {
                 MenuItem("sniff", R.drawable.ic_movie, "媒体嗅探", "智能识别视频、音频、HLS/DASH 清单并折叠分片") { sniffMedia() },
                 MenuItem("resources", R.drawable.ic_folder, "页面资源", "分类识别图片、脚本、样式、字体与媒体") { pageResources() },
                 MenuItem("source", R.drawable.ic_code, "递归源码归档", "递归打包 HTML、CSS/JS、图片、字体、source map 与诊断日志") { downloadSourceZip() },
+                MenuItem("networklab", R.drawable.ic_network, "网络实验室", "请求重写、Mock、Header/Body 修改与 JS/CSS 注入") { showNetworkLab() },
                 MenuItem("netlog", R.drawable.ic_network, "网络日志", "查看请求状态、类型、大小与耗时") { showNetLog() },
                 MenuItem("devtools", R.drawable.ic_tools, "开发者工具", "MCP 接口、Console 与页面状态") { devTools() }
             )
@@ -1197,7 +1355,7 @@ class MainActivity : AppCompatActivity() {
             listOf(
                 MenuItem("lanapi", R.drawable.ic_link, "局域网 MCP 接口", if (settings.lanApiEnabled) "已开启 · HTTP Bridge · Token 认证" else "已关闭 · 仅本机") { toggleLanApi() },
                 MenuItem("menuconfig", R.drawable.ic_settings, "常用工具设置", "选择工具中心的常用快捷入口") { showMenuConfig() },
-                MenuItem("about", R.drawable.ic_info, "关于 BrowserDiag", "v3.3.0 · MCP ${serverPort}") { showAbout() }
+                MenuItem("about", R.drawable.ic_info, "关于 BrowserDiag", "v3.4.0 · MCP ${serverPort}") { showAbout() }
             )
         )
     )
@@ -1278,7 +1436,7 @@ class MainActivity : AppCompatActivity() {
         val allItems = categories.flatMap { it.items }
         val cfg = settings.getMenuConfig()
         val fixedPageActions = setOf("find", "save", "share")
-        val defaultFavorites = listOf("history", "downloads", "netlog", "devtools", "engine", "userscript", "dark", "ua")
+        val defaultFavorites = listOf("history", "downloads", "networklab", "netlog", "devtools", "userscript", "dark", "ua")
         val favoriteIds = if (cfg.isEmpty()) {
             defaultFavorites
         } else {
@@ -2565,8 +2723,8 @@ class MainActivity : AppCompatActivity() {
         val api = apiBaseUrl()
         val token = settings.apiToken
         val ua = currentWeb()?.settings?.userAgentString ?: ""
-        showBrowserSheet("BrowserDiag", "安全浏览 + 页面诊断 · v3.3.0") { content, _ ->
-            content.addView(panelRow(R.drawable.ic_info, "BrowserDiag 3.3.0", "Android 浏览器与诊断后端"))
+        showBrowserSheet("BrowserDiag", "安全浏览 + 页面诊断 · v3.4.0") { content, _ ->
+            content.addView(panelRow(R.drawable.ic_info, "BrowserDiag 3.4.0", "Android 浏览器、网络实验室与诊断后端"))
             content.addView(panelRow(R.drawable.ic_network, "MCP 接口", "$api · HTTP Bridge · Token 认证", onClick = {
                 copyText(api)
             }))
@@ -2831,6 +2989,8 @@ class MainActivity : AppCompatActivity() {
         if (bytes > 0) add(formatBytes(bytes))
         val duration = entry.optDouble("duration")
         if (duration > 0) add("${duration.toLong()} ms")
+        val matchedRules = entry.optJSONArray("rules")?.length() ?: 0
+        if (matchedRules > 0) add("规则 $matchedRules")
         if (isEmpty()) add(compactUrl(url).take(120))
     }.joinToString(" · ")
 
@@ -2839,6 +2999,7 @@ class MainActivity : AppCompatActivity() {
         val webUrl = url.startsWith("http://", true) || url.startsWith("https://", true)
         val actions = mutableListOf<String>()
         if (webUrl) actions += "新标签打开"
+        if (webUrl) actions += "从此请求创建规则"
         actions += "复制 URL"
         actions += "复制请求信息"
         AlertDialog.Builder(this)
@@ -2846,6 +3007,10 @@ class MainActivity : AppCompatActivity() {
             .setItems(actions.toTypedArray()) { dialog, which ->
                 when (actions[which]) {
                     "新标签打开" -> newTab(url)
+                    "从此请求创建规则" -> showNetworkRuleTypePicker(
+                        defaultPattern = url,
+                        defaultMethod = entry.optString("method", "GET").uppercase(Locale.ROOT)
+                    )
                     "复制 URL" -> copyText(url)
                     "复制请求信息" -> copyText(
                         "${networkEntryTitle(entry)}\n${networkEntrySubtitle(entry)}\n$url"
@@ -2854,6 +3019,406 @@ class MainActivity : AppCompatActivity() {
                 dialog.dismiss()
             }
             .show()
+    }
+
+    // ==================== 网络实验室 ====================
+
+    /** Chrome DevTools 风格的规则中心：规则列表、启停、命中记录与编辑统一从这里进入。 */
+    private fun showNetworkLab() {
+        val rules = networkRules.allRules()
+        val enabled = rules.count { it.enabled }
+        val hitCount = networkRules.recentHits(200).length()
+        showBrowserSheet(
+            title = "网络实验室",
+            subtitle = "${rules.size} 条规则 · $enabled 条启用 · 原生 + document-start 双层引擎",
+            headerActionLabel = "＋ 规则",
+            headerAction = { dialog ->
+                dialog.dismiss()
+                showNetworkRuleTypePicker()
+            }
+        ) { content, dialog ->
+            content.addView(panelRow(
+                R.drawable.ic_shield,
+                "无证书网络调试",
+                "不使用 HTTPS MITM；支持静态资源拦截、fetch/XHR Body、Mock、响应替换及页面注入。"
+            ))
+            val actions = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(1.dp(), 5.dp(), 1.dp(), 7.dp())
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                )
+                addView(quickAction(R.drawable.ic_history, "命中记录 $hitCount") {
+                    dialog.dismiss()
+                    showNetworkRuleHits()
+                })
+                addView(quickAction(R.drawable.ic_refresh, "重新应用") {
+                    refreshNetworkRuleHooks()
+                    toast("网络规则已重新应用")
+                })
+            }
+            content.addView(actions)
+            content.addView(sectionTitle("规则 · 高优先级先执行"))
+            if (rules.isEmpty()) {
+                content.addView(emptyPanel(
+                    R.drawable.ic_network,
+                    "还没有网络规则",
+                    "创建规则后可重写请求、Mock API、替换响应，或按页面地址注入 JS/CSS。"
+                ))
+                return@showBrowserSheet
+            }
+            rules.forEach { rule ->
+                val scope = if (rule.action == NetworkRuleAction.INJECT_JS || rule.action == NetworkRuleAction.INJECT_CSS) {
+                    rule.urlPattern
+                } else {
+                    "${rule.methods.ifBlank { "*" }} · ${rule.urlPattern}"
+                }
+                content.addView(panelRow(
+                    iconRes = networkRuleIcon(rule.action),
+                    title = rule.name,
+                    subtitle = "${if (rule.enabled) "已启用" else "已停用"} · ${rule.action.label} · P${rule.priority} · ${scope.take(96)}",
+                    trailingIcon = R.drawable.ic_forward,
+                    selected = rule.enabled,
+                    onTrailing = {
+                        dialog.dismiss()
+                        showNetworkRuleActions(rule)
+                    },
+                    onClick = {
+                        dialog.dismiss()
+                        showNetworkRuleActions(rule)
+                    }
+                ))
+            }
+        }
+    }
+
+    private fun networkRuleIcon(action: NetworkRuleAction): Int = when (action) {
+        NetworkRuleAction.BLOCK -> R.drawable.ic_stop
+        NetworkRuleAction.REWRITE_URL -> R.drawable.ic_arrow
+        NetworkRuleAction.SET_REQUEST_HEADERS,
+        NetworkRuleAction.SET_RESPONSE_HEADERS -> R.drawable.ic_network
+        NetworkRuleAction.REPLACE_REQUEST_BODY,
+        NetworkRuleAction.REPLACE_RESPONSE_BODY,
+        NetworkRuleAction.INJECT_JS,
+        NetworkRuleAction.INJECT_CSS -> R.drawable.ic_code
+        NetworkRuleAction.MOCK_RESPONSE -> R.drawable.ic_play
+        NetworkRuleAction.DELAY -> R.drawable.ic_history
+    }
+
+    private fun showNetworkRuleTypePicker(defaultPattern: String? = null, defaultMethod: String? = null) {
+        showBrowserSheet(
+            title = "创建网络规则",
+            subtitle = if (defaultPattern.isNullOrBlank()) "选择要执行的动作" else "已带入当前请求 · ${displayHost(defaultPattern)}"
+        ) { content, dialog ->
+            NetworkRuleAction.entries.forEach { action ->
+                content.addView(panelRow(
+                    iconRes = networkRuleIcon(action),
+                    title = action.label,
+                    subtitle = action.description,
+                    trailingIcon = R.drawable.ic_forward,
+                    onTrailing = {
+                        dialog.dismiss()
+                        showNetworkRuleEditor(null, action, defaultPattern, defaultMethod)
+                    },
+                    onClick = {
+                        dialog.dismiss()
+                        showNetworkRuleEditor(null, action, defaultPattern, defaultMethod)
+                    }
+                ))
+            }
+        }
+    }
+
+    private fun showNetworkRuleActions(rule: NetworkRule) {
+        val actions = arrayOf(
+            if (rule.enabled) "停用规则" else "启用规则",
+            "编辑规则",
+            "复制为停用规则",
+            "删除规则"
+        )
+        AlertDialog.Builder(this)
+            .setTitle(rule.name)
+            .setMessage("${rule.action.label} · P${rule.priority}\n${rule.methods} · ${rule.urlPattern}")
+            .setItems(actions) { dialog, which ->
+                dialog.dismiss()
+                when (which) {
+                    0 -> {
+                        networkRules.setEnabled(rule.id, !rule.enabled)
+                        refreshNetworkRuleHooks()
+                        if (rule.enabled && rule.action == NetworkRuleAction.INJECT_CSS) {
+                            removeInjectedNetworkCss(rule.id)
+                        }
+                        toast(if (rule.enabled) "规则已停用" else "规则已启用")
+                        showNetworkLab()
+                    }
+                    1 -> showNetworkRuleEditor(rule, rule.action)
+                    2 -> {
+                        val copy = rule.copy(
+                            id = "nr_${System.currentTimeMillis()}",
+                            name = "${rule.name} · 副本".take(100),
+                            enabled = false
+                        )
+                        networkRules.upsert(copy)
+                        refreshNetworkRuleHooks()
+                        toast("已复制为停用规则")
+                        showNetworkLab()
+                    }
+                    3 -> confirmDeleteNetworkRule(rule)
+                }
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun confirmDeleteNetworkRule(rule: NetworkRule) {
+        AlertDialog.Builder(this)
+            .setTitle("删除网络规则？")
+            .setMessage("将永久删除“${rule.name}”。")
+            .setNegativeButton("取消", null)
+            .setPositiveButton("删除") { _, _ ->
+                networkRules.remove(rule.id)
+                refreshNetworkRuleHooks()
+                if (rule.action == NetworkRuleAction.INJECT_CSS) removeInjectedNetworkCss(rule.id)
+                toast("规则已删除")
+                showNetworkLab()
+            }
+            .show()
+    }
+
+    private fun removeInjectedNetworkCss(ruleId: String) {
+        val id = JSONObject.quote(ruleId)
+        tabs.all.forEach { tab ->
+            tab.webView.evaluateJavascript(
+                "(function(){var id=$id;document.querySelectorAll('style[data-browserdiag-rule]').forEach(function(e){if(e.getAttribute('data-browserdiag-rule')===id)e.remove()});return true})()"
+            ) { }
+        }
+    }
+
+    private fun showNetworkRuleEditor(
+        existing: NetworkRule?,
+        action: NetworkRuleAction,
+        defaultPattern: String? = null,
+        defaultMethod: String? = null
+    ) {
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(20.dp(), 4.dp(), 20.dp(), 12.dp())
+        }
+        fun addField(
+            label: String,
+            hint: String,
+            value: String,
+            lines: Int = 1,
+            numeric: Boolean = false
+        ): EditText {
+            container.addView(sectionTitle(label))
+            return EditText(this).apply {
+                this.hint = hint
+                setText(value)
+                textSize = 13.5f
+                setTextColor(textColor())
+                setHintTextColor(secondaryTextColor())
+                if (lines > 1) {
+                    minLines = lines
+                    maxLines = maxOf(lines, 12)
+                    gravity = Gravity.TOP or Gravity.START
+                    typeface = android.graphics.Typeface.MONOSPACE
+                    inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                        InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+                } else {
+                    setSingleLine(true)
+                    inputType = if (numeric) InputType.TYPE_CLASS_NUMBER else
+                        InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+                }
+                setPadding(12.dp(), 8.dp(), 12.dp(), 8.dp())
+                container.addView(this)
+            }
+        }
+
+        val nameInput = addField("规则名称", action.label, existing?.name ?: action.label)
+        val patternInput = addField(
+            "URL 匹配",
+            "*://api.example.com/* 或 regex:https://…",
+            existing?.urlPattern ?: defaultPattern ?: "*"
+        )
+        val methodInput = if (action != NetworkRuleAction.INJECT_JS && action != NetworkRuleAction.INJECT_CSS) {
+            addField("请求方法", "* 或 GET,POST", existing?.methods ?: defaultMethod ?: "*")
+        } else null
+        val priorityInput = addField("优先级", "0-1000，数值越大越先执行", (existing?.priority ?: 100).toString(), numeric = true)
+
+        var valueInput: EditText? = null
+        var replacementInput: EditText? = null
+        var headersInput: EditText? = null
+        var statusInput: EditText? = null
+        var mimeInput: EditText? = null
+        var delayInput: EditText? = null
+        when (action) {
+            NetworkRuleAction.BLOCK -> Unit
+            NetworkRuleAction.REWRITE_URL -> {
+                valueInput = addField(
+                    "目标 URL",
+                    "https://host{path}?{query}；regex 模式可用 \$1",
+                    existing?.value.orEmpty(),
+                    2
+                )
+            }
+            NetworkRuleAction.SET_REQUEST_HEADERS,
+            NetworkRuleAction.SET_RESPONSE_HEADERS -> {
+                headersInput = addField(
+                    "Header（每行一个）",
+                    "X-Debug: true\nAuthorization: Bearer …",
+                    existing?.headers?.entries?.joinToString("\n") { "${it.key}: ${it.value}" }.orEmpty(),
+                    4
+                )
+            }
+            NetworkRuleAction.REPLACE_REQUEST_BODY,
+            NetworkRuleAction.REPLACE_RESPONSE_BODY -> {
+                valueInput = addField(
+                    "查找内容",
+                    "普通文本；正则使用 regex:pattern",
+                    existing?.value.orEmpty(),
+                    3
+                )
+                replacementInput = addField("替换为", "支持正则捕获组 \$1", existing?.replacement.orEmpty(), 3)
+            }
+            NetworkRuleAction.MOCK_RESPONSE -> {
+                statusInput = addField("HTTP 状态码", "200 / 404 / 500", (existing?.statusCode ?: 200).toString(), numeric = true)
+                mimeInput = addField("Content-Type", "application/json; charset=utf-8", existing?.mimeType ?: "application/json; charset=utf-8")
+                headersInput = addField(
+                    "响应 Header（可选）",
+                    "Cache-Control: no-store",
+                    existing?.headers?.entries?.joinToString("\n") { "${it.key}: ${it.value}" }.orEmpty(),
+                    3
+                )
+                valueInput = addField("响应 Body", "{\"ok\":true}", existing?.value.orEmpty(), 7)
+            }
+            NetworkRuleAction.INJECT_JS -> {
+                valueInput = addField(
+                    "JavaScript",
+                    "console.log('BrowserDiag injected');",
+                    existing?.value.orEmpty(),
+                    9
+                )
+            }
+            NetworkRuleAction.INJECT_CSS -> {
+                valueInput = addField("CSS", "body { outline: 2px solid #0B57D0; }", existing?.value.orEmpty(), 8)
+            }
+            NetworkRuleAction.DELAY -> {
+                delayInput = addField("延迟毫秒", "1-10000", (existing?.delayMs ?: 1000).toString(), numeric = true)
+            }
+        }
+
+        val scroll = ScrollView(this).apply {
+            isFillViewport = true
+            addView(container)
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(if (existing == null) "${action.label}规则" else "编辑 · ${action.label}")
+            .setMessage(action.description + if (action == NetworkRuleAction.INJECT_JS) "。仅注入你信任的代码。" else "")
+            .setView(scroll)
+            .setPositiveButton("保存", null)
+            .setNegativeButton("取消", null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(android.content.DialogInterface.BUTTON_POSITIVE).setOnClickListener {
+                val headers = parseNetworkHeaders(headersInput?.text?.toString().orEmpty())
+                val candidate = NetworkRule(
+                    id = existing?.id ?: "nr_${System.currentTimeMillis()}",
+                    name = nameInput.text.toString().trim(),
+                    enabled = existing?.enabled ?: true,
+                    priority = priorityInput.text.toString().toIntOrNull() ?: -1,
+                    urlPattern = patternInput.text.toString().trim().ifEmpty { "*" },
+                    methods = methodInput?.text?.toString()?.trim().orEmpty().ifEmpty { "*" },
+                    action = action,
+                    value = valueInput?.text?.toString().orEmpty(),
+                    replacement = replacementInput?.text?.toString().orEmpty(),
+                    headers = headers,
+                    statusCode = statusInput?.text?.toString()?.toIntOrNull() ?: (existing?.statusCode ?: 200),
+                    mimeType = mimeInput?.text?.toString()?.trim().orEmpty().ifEmpty { existing?.mimeType ?: "text/plain; charset=utf-8" },
+                    delayMs = delayInput?.text?.toString()?.toIntOrNull() ?: 0
+                )
+                val error = networkRuleValidationError(candidate)
+                if (error != null) {
+                    toast(error)
+                    return@setOnClickListener
+                }
+                val saved = runCatching { networkRules.upsert(candidate) }.getOrElse { failure ->
+                    toast("保存失败：${failure.message ?: "无效规则"}")
+                    return@setOnClickListener
+                }
+                refreshNetworkRuleHooks()
+                if (saved.action == NetworkRuleAction.INJECT_JS || saved.action == NetworkRuleAction.INJECT_CSS) {
+                    currentWeb()?.evaluateJavascript(wrapNetworkInjectionRule(saved)) { }
+                }
+                dialog.dismiss()
+                toast(if (existing == null) "网络规则已创建" else "网络规则已更新")
+                showNetworkLab()
+            }
+        }
+        dialog.show()
+    }
+
+    private fun showNetworkRuleHits() {
+        val nativeHits = networkRules.recentHits(120)
+        val wv = currentWeb()
+        if (wv == null) {
+            renderNetworkRuleHits(nativeHits, JSONArray())
+            return
+        }
+        wv.evaluateJavascript("JSON.stringify((window.__bdRuleHits||[]).slice(-120).reverse())") { raw ->
+            renderNetworkRuleHits(nativeHits, decodeJsArray(raw))
+        }
+    }
+
+    private fun renderNetworkRuleHits(nativeHits: JSONArray, jsHits: JSONArray) {
+        val merged = mutableListOf<JSONObject>()
+        for (index in 0 until nativeHits.length()) nativeHits.optJSONObject(index)?.let { merged += it }
+        for (index in 0 until jsHits.length()) jsHits.optJSONObject(index)?.let { merged += it }
+        val hits = merged.sortedByDescending { it.optLong("ts") }.take(180)
+        showBrowserSheet(
+            title = "规则命中记录",
+            subtitle = "${hits.size} 条 · 原生资源 + 当前页 fetch/XHR/注入",
+            headerActionLabel = if (hits.isEmpty()) null else "清空",
+            headerAction = if (hits.isEmpty()) null else { dialog ->
+                networkRules.clearHits()
+                tabs.all.forEach { tab -> tab.webView.evaluateJavascript("window.__bdRuleHits=[];true") { } }
+                dialog.dismiss()
+                toast("规则命中记录已清空")
+            }
+        ) { content, _ ->
+            if (hits.isEmpty()) {
+                content.addView(emptyPanel(R.drawable.ic_history, "暂无规则命中", "访问匹配页面或触发请求后，这里会显示规则、阶段和结果。"))
+                return@showBrowserSheet
+            }
+            hits.forEach { hit ->
+                val action = NetworkRuleAction.fromKey(hit.optString("action"))
+                val url = hit.optString("url")
+                val phase = when (hit.optString("phase")) {
+                    "request" -> "请求"
+                    "response" -> "响应"
+                    "inject" -> "注入"
+                    else -> hit.optString("phase", "JS")
+                }
+                val detail = hit.optString("detail").ifBlank { displayHost(url) }
+                content.addView(panelRow(
+                    iconRes = action?.let(::networkRuleIcon) ?: R.drawable.ic_network,
+                    title = hit.optString("ruleName").ifBlank { action?.label ?: "网络规则" },
+                    subtitle = "${relativeRuleHitTime(hit.optLong("ts"))} · $phase · ${displayHost(url)}\n${detail.take(120)}"
+                ))
+            }
+        }
+    }
+
+    private fun relativeRuleHitTime(ts: Long): String {
+        val seconds = ((System.currentTimeMillis() - ts).coerceAtLeast(0) / 1000)
+        return when {
+            ts <= 0 -> "刚刚"
+            seconds < 5 -> "刚刚"
+            seconds < 60 -> "${seconds} 秒前"
+            seconds < 3600 -> "${seconds / 60} 分钟前"
+            else -> "${seconds / 3600} 小时前"
+        }
     }
 
     /** WebView 会把 JavaScript 字符串结果再编码一层；兼容 JSON.stringify(...) 的双层返回值。 */
@@ -3090,7 +3655,7 @@ class MainActivity : AppCompatActivity() {
         val configurable = allItems.filter {
             it.id != "menuconfig" && it.id != "about" && it.id !in fixedPageActions
         }
-        val defaults = listOf("history", "downloads", "netlog", "devtools", "engine", "userscript", "dark", "ua")
+        val defaults = listOf("history", "downloads", "networklab", "netlog", "devtools", "userscript", "dark", "ua")
         val stored = settings.getMenuConfig()
         val selected = linkedSetOf<String>().apply {
             if (stored.isEmpty()) {
@@ -3176,6 +3741,8 @@ class MainActivity : AppCompatActivity() {
                     { synchronized(consoleLogs) { consoleLogs.toList() } },
                     { settings },
                     { tabs },
+                    { networkRules },
+                    { runOnUiThread { refreshNetworkRuleHooks() } },
                     settings.apiToken
                 )
                 s.start(5000, true)
@@ -3219,6 +3786,10 @@ class MainActivity : AppCompatActivity() {
         server?.stop()
         tts?.stop()
         tts?.shutdown()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            runCatching { ServiceWorkerController.getInstance().setServiceWorkerClient(null) }
+        }
+        tabs.all.forEach { releaseNetworkRuleHooks(it.webView) }
         tabs.destroyAll()
         super.onDestroy()
     }
@@ -3508,10 +4079,39 @@ class MainActivity : AppCompatActivity() {
 
         private val NETWORK_HOOK_JS = """
             (function(){
-              if (window.__bdHooked) return;
-              window.__bdHooked = true;
-              window.__bdNet = [];
-              function record(u,m,s,t,mime,bytes,duration){
+              var initialRules=[];
+              try{initialRules=JSON.parse(__BD_NETWORK_RULES_JSON__);}catch(_){}
+              if(window.__bdHooked){
+                if(window.__bdSetNetworkRules)window.__bdSetNetworkRules(initialRules);
+                return;
+              }
+              window.__bdHooked=true;
+              var rules=Array.isArray(initialRules)?initialRules:[];
+              window.__bdNetworkRules=rules;
+              window.__bdNet=[];
+              window.__bdRuleHits=[];
+
+              function recordRuleHit(hit){
+                if(!hit)return;
+                var item={
+                  ts:Date.now(),
+                  ruleId:String(hit.ruleId||'').slice(0,80),
+                  ruleName:String(hit.ruleName||'').slice(0,120),
+                  action:String(hit.action||'').slice(0,40),
+                  url:String(hit.url||'').slice(0,4096),
+                  phase:String(hit.phase||'js').slice(0,40),
+                  detail:String(hit.detail||'').slice(0,300)
+                };
+                window.__bdRuleHits.push(item);
+                if(window.__bdRuleHits.length>200)window.__bdRuleHits.shift();
+              }
+              window.__bdRecordRuleHit=recordRuleHit;
+              window.__bdSetNetworkRules=function(next){
+                rules=Array.isArray(next)?next:[];
+                window.__bdNetworkRules=rules;
+              };
+
+              function record(u,m,s,t,mime,bytes,duration,matchedRules){
                 window.__bdNet.push({
                   url:String(u).slice(0,4096),
                   method:m,
@@ -3520,56 +4120,517 @@ class MainActivity : AppCompatActivity() {
                   mime:String(mime || '').slice(0,160),
                   bytes:Number(bytes) || 0,
                   duration:Math.max(0,Math.round(Number(duration) || 0)),
+                  rules:Array.isArray(matchedRules)?matchedRules.slice(0,12):[],
                   ts:Date.now()
                 });
-                if(window.__bdNet.length>300) window.__bdNet.shift();
+                if(window.__bdNet.length>500)window.__bdNet.shift();
               }
-              function urlOf(u){ if(typeof u==='string')return u;if(u&&u.url)return u.url;if(u&&u.href)return u.href;return String(u); }
-              var op = XMLHttpRequest.prototype.open;
-              var sp = XMLHttpRequest.prototype.send;
-              XMLHttpRequest.prototype.open = function(m,u){ this.__u=u; this.__m=m; return op.apply(this,arguments); };
-              XMLHttpRequest.prototype.send = function(){
-                var xhr = this;
-                var start = performance.now();
-                var recorded = false;
-                function finish(){
-                  if (recorded) return;
-                  recorded = true;
-                  record(
-                    xhr.responseURL || xhr.__u,
-                    xhr.__m,
-                    xhr.status,
-                    'xhr',
-                    xhr.getResponseHeader('content-type') || '',
-                    xhr.getResponseHeader('content-length') || 0,
-                    performance.now() - start
-                  );
+              function urlOf(value){
+                if(typeof value==='string')return value;
+                if(value&&value.url)return value.url;
+                if(value&&value.href)return value.href;
+                return String(value||'');
+              }
+              function absoluteUrl(value){
+                try{return new URL(urlOf(value),location.href).href;}catch(_){return urlOf(value);}
+              }
+              function matchPattern(pattern,url){
+                if(!pattern||pattern==='*'||pattern==='<all_urls>')return true;
+                try{
+                  var low=String(pattern).toLowerCase();
+                  if(low.indexOf('regex:')===0)return new RegExp(String(pattern).slice(6)).test(url);
+                  if(pattern.length>2&&pattern.charAt(0)==='/'&&pattern.charAt(pattern.length-1)==='/'){
+                    return new RegExp(pattern.slice(1,-1)).test(url);
+                  }
+                  var special="\\.^+?()[]{}|"+String.fromCharCode(36);
+                  var out='';
+                  for(var i=0;i<pattern.length;i++){
+                    var ch=pattern.charAt(i);
+                    if(ch==='*')out+='.*';else{if(special.indexOf(ch)>=0)out+='\\';out+=ch;}
+                  }
+                  return new RegExp('^'+out+String.fromCharCode(36),'i').test(url);
+                }catch(_){return false;}
+              }
+              function matchMethod(rule,method){
+                var raw=String(rule.methods||'*').trim();
+                if(!raw||raw==='*')return true;
+                return raw.split(/[ ,|]+/).some(function(v){return String(v).toUpperCase()===method;});
+              }
+              function matching(action,url,method){
+                return rules.filter(function(rule){
+                  return rule&&rule.enabled!==false&&rule.action===action&&
+                    matchMethod(rule,method)&&matchPattern(String(rule.urlPattern||'*'),url);
+                });
+              }
+              function matchingEither(action,first,second,method){
+                var out=[];
+                var seen=Object.create(null);
+                [first,second].forEach(function(url){
+                  if(!url)return;
+                  matching(action,url,method).forEach(function(rule){
+                    var key=String(rule.id||rule.name||out.length);
+                    if(!seen[key]){seen[key]=true;out.push(rule);}
+                  });
+                });
+                return out;
+              }
+              function firstTerminal(url,method){
+                for(var i=0;i<rules.length;i++){
+                  var rule=rules[i];
+                  if(!rule||rule.enabled===false)continue;
+                  if(rule.action!=='block'&&rule.action!=='mock')continue;
+                  if(matchMethod(rule,method)&&matchPattern(String(rule.urlPattern||'*'),url))return rule;
                 }
-                this.addEventListener('load', finish);
-                this.addEventListener('error', finish);
-                this.addEventListener('abort', finish);
-                this.addEventListener('timeout', finish);
-                return sp.apply(this,arguments);
-              };
-              var of = window.fetch;
-              window.fetch = function(){
-                var u = arguments[0];
-                var init = arguments[1] || {};
-                var method = String(init.method || (u && u.method) || 'GET').toUpperCase();
-                var start = performance.now();
-                return of.apply(this,arguments).then(function(r){
-                  record(
-                    r.url || urlOf(u),
-                    method,
-                    r.status,
-                    'fetch',
-                    r.headers.get('content-type') || '',
-                    r.headers.get('content-length') || 0,
-                    performance.now() - start
-                  );
-                  return r;
-                }).catch(function(e){ record(urlOf(u),method,0,'fetch','','',performance.now() - start); throw e; });
-              };
+                return null;
+              }
+              function remember(applied,rule,url,phase,detail){
+                var label=String(rule.name||rule.id||rule.action||'规则');
+                if(applied.indexOf(label)<0)applied.push(label);
+                recordRuleHit({
+                  ruleId:rule.id,ruleName:label,action:rule.action,url:url,phase:phase,detail:detail
+                });
+              }
+              function replaceText(text,rule){
+                var find=String(rule.value||'');
+                if(!find)return String(text);
+                var replacement=String(rule.replacement||'');
+                try{
+                  if(find.toLowerCase().indexOf('regex:')===0){
+                    return String(text).replace(new RegExp(find.slice(6),'g'),replacement);
+                  }
+                }catch(_){return String(text);}
+                return String(text).split(find).join(replacement);
+              }
+              function rewriteUrl(url,rule){
+                var replacement=String(rule.value||'');
+                if(!replacement)return url;
+                var pattern=String(rule.urlPattern||'*');
+                try{
+                  if(pattern.toLowerCase().indexOf('regex:')===0){
+                    return url.replace(new RegExp(pattern.slice(6)),replacement);
+                  }
+                  if(pattern.length>2&&pattern.charAt(0)==='/'&&pattern.charAt(pattern.length-1)==='/'){
+                    return url.replace(new RegExp(pattern.slice(1,-1)),replacement);
+                  }
+                  var parsed=new URL(url,location.href);
+                  return replacement
+                    .split('{url}').join(url)
+                    .split('{host}').join(parsed.host)
+                    .split('{path}').join(parsed.pathname)
+                    .split('{query}').join(parsed.search?parsed.search.slice(1):'');
+                }catch(_){return url;}
+              }
+              function headerEntries(rule){
+                var headers=rule&&rule.headers&&typeof rule.headers==='object'?rule.headers:{};
+                return Object.keys(headers).map(function(name){return [name,String(headers[name])];});
+              }
+              function requestHeaderRules(first,second,method){
+                return matchingEither('request_headers',first,second,method);
+              }
+              function responseHeaderRules(first,second,method){
+                return matchingEither('response_headers',first,second,method);
+              }
+              function copyResponseMetadata(target,source){
+                try{Object.defineProperty(target,'url',{value:source.url,configurable:true});}catch(_){}
+                try{Object.defineProperty(target,'redirected',{value:source.redirected,configurable:true});}catch(_){}
+                try{Object.defineProperty(target,'type',{value:source.type,configurable:true});}catch(_){}
+                return target;
+              }
+
+              var nativeFetch=window.fetch;
+              if(typeof nativeFetch==='function'){
+                window.fetch=function(input,init){
+                  init=init||{};
+                  var originalUrl=absoluteUrl(input);
+                  var method=String(init.method||(input&&input.method)||'GET').toUpperCase();
+                  var start=performance.now();
+                  var applied=[];
+                  var terminal=firstTerminal(originalUrl,method);
+                  if(terminal&&terminal.action==='block'){
+                    remember(applied,terminal,originalUrl,'request','fetch 已阻止');
+                    record(originalUrl,method,0,'fetch','',0,performance.now()-start,applied);
+                    return Promise.reject(new TypeError('Blocked by BrowserDiag network rule: '+String(terminal.name||terminal.id||'')));
+                  }
+                  if(terminal&&terminal.action==='mock'){
+                    var mockHeaders=new Headers();
+                    headerEntries(terminal).forEach(function(pair){try{mockHeaders.set(pair[0],pair[1]);}catch(_){}});
+                    if(!mockHeaders.has('content-type'))mockHeaders.set('content-type',String(terminal.mimeType||'text/plain; charset=utf-8'));
+                    var mockStatus=Number(terminal.statusCode)||200;
+                    if(!((mockStatus>=200&&mockStatus<=299)||(mockStatus>=400&&mockStatus<=599)))mockStatus=200;
+                    var mockBody=(method==='HEAD'||mockStatus===204||mockStatus===205)?null:String(terminal.value||'');
+                    var mocked=new Response(mockBody,{status:mockStatus,headers:mockHeaders});
+                    try{Object.defineProperty(mocked,'url',{value:originalUrl,configurable:true});}catch(_){}
+                    remember(applied,terminal,originalUrl,'response','fetch Mock '+mockStatus);
+                    record(originalUrl,method,mockStatus,'fetch',mockHeaders.get('content-type')||'',mockBody===null?0:mockBody.length,performance.now()-start,applied);
+                    return Promise.resolve(mocked);
+                  }
+
+                  var request;
+                  try{request=new Request(input,init);}catch(error){return nativeFetch.apply(this,arguments);}
+                  var currentUrl=request.url||originalUrl;
+                  matching('rewrite_url',originalUrl,method).forEach(function(rule){
+                    var next=rewriteUrl(currentUrl,rule);
+                    if(next&&next!==currentUrl){
+                      remember(applied,rule,originalUrl,'request','URL → '+next.slice(0,220));
+                      currentUrl=next;
+                    }
+                  });
+                  var crossOriginRewrite=false;
+                  try{crossOriginRewrite=new URL(originalUrl,location.href).origin!==new URL(currentUrl,location.href).origin;}catch(_){}
+                  try{if(currentUrl!==request.url)request=new Request(currentUrl,request);}catch(_){}
+                  if(crossOriginRewrite){
+                    try{
+                      var safeHeaders=new Headers(request.headers);
+                      safeHeaders.delete('authorization');
+                      safeHeaders.delete('proxy-authorization');
+                      request=new Request(request,{headers:safeHeaders});
+                    }catch(_){}
+                  }
+
+                  var reqHeaderRules=requestHeaderRules(originalUrl,currentUrl,method);
+                  if(reqHeaderRules.length){
+                    try{
+                      var requestHeaders=new Headers(request.headers);
+                      var setNames=Object.create(null);
+                      reqHeaderRules.forEach(function(rule){
+                        var changed=false;
+                        headerEntries(rule).forEach(function(pair){
+                          var key=pair[0].toLowerCase();
+                          if(setNames[key])return;
+                          try{requestHeaders.set(pair[0],pair[1]);setNames[key]=true;changed=true;}catch(_){}
+                        });
+                        if(changed)remember(applied,rule,originalUrl,'request','请求 Header 已修改');
+                      });
+                      request=new Request(request,{headers:requestHeaders});
+                    }catch(_){}
+                  }
+
+                  var bodyRules=matchingEither('request_body',originalUrl,currentUrl,method);
+                  var prepared=Promise.resolve(request);
+                  if(bodyRules.length&&method!=='GET'&&method!=='HEAD'){
+                    prepared=request.clone().text().then(function(body){
+                      var nextBody=body;
+                      bodyRules.forEach(function(rule){
+                        var changed=replaceText(nextBody,rule);
+                        remember(applied,rule,originalUrl,'request',changed!==nextBody?'请求 Body 已替换':'请求 Body 未找到替换内容');
+                        nextBody=changed;
+                      });
+                      if(nextBody===body)return request;
+                      var options={
+                        method:request.method,headers:request.headers,body:nextBody,mode:request.mode,
+                        credentials:request.credentials,cache:request.cache,redirect:request.redirect,
+                        referrer:request.referrer,referrerPolicy:request.referrerPolicy,
+                        integrity:request.integrity,keepalive:request.keepalive
+                      };
+                      if(request.signal)options.signal=request.signal;
+                      return new Request(request.url,options);
+                    }).catch(function(){return request;});
+                  }
+
+                  return prepared.then(function(outbound){
+                    return nativeFetch.call(window,outbound);
+                  }).then(function(response){
+                    var responseUrl=response.url||currentUrl||originalUrl;
+                    var bodyRewriteRules=matchingEither('response_body',originalUrl,responseUrl,method);
+                    var responseHeadersRules=responseHeaderRules(originalUrl,responseUrl,method);
+                    var contentType=response.headers.get('content-type')||'';
+                    var isText=/^(text\/)|json|javascript|xml|svg|x-www-form-urlencoded/i.test(contentType);
+
+                    function finish(result,bodyBytes){
+                      record(result.url||responseUrl,method,result.status,'fetch',result.headers.get('content-type')||contentType,bodyBytes||result.headers.get('content-length')||0,performance.now()-start,applied);
+                      return result;
+                    }
+                    function rewrittenHeaders(){
+                      var headers=new Headers(response.headers);
+                      var setNames=Object.create(null);
+                      responseHeadersRules.forEach(function(rule){
+                        var changed=false;
+                        headerEntries(rule).forEach(function(pair){
+                          var key=pair[0].toLowerCase();
+                          if(setNames[key])return;
+                          try{headers.set(pair[0],pair[1]);setNames[key]=true;changed=true;}catch(_){}
+                        });
+                        if(changed)remember(applied,rule,responseUrl,'response','响应 Header 已修改');
+                      });
+                      return headers;
+                    }
+
+                    if(bodyRewriteRules.length&&isText){
+                      return response.clone().text().then(function(body){
+                        var nextBody=body;
+                        bodyRewriteRules.forEach(function(rule){
+                          var changed=replaceText(nextBody,rule);
+                          remember(applied,rule,responseUrl,'response',changed!==nextBody?'响应内容已替换':'响应内容未找到替换内容');
+                          nextBody=changed;
+                        });
+                        var headers=rewrittenHeaders();
+                        headers.delete('content-length');
+                        var result=copyResponseMetadata(new Response(nextBody,{status:response.status,statusText:response.statusText,headers:headers}),response);
+                        return finish(result,nextBody.length);
+                      }).catch(function(){return finish(response,0);});
+                    }
+                    if(responseHeadersRules.length){
+                      try{
+                        var result=copyResponseMetadata(new Response(response.body,{status:response.status,statusText:response.statusText,headers:rewrittenHeaders()}),response);
+                        return finish(result,0);
+                      }catch(_){}
+                    }
+                    return finish(response,0);
+                  }).catch(function(error){
+                    record(currentUrl||originalUrl,method,0,'fetch','',0,performance.now()-start,applied);
+                    throw error;
+                  });
+                };
+              }
+
+              var XHR=window.XMLHttpRequest;
+              if(XHR&&XHR.prototype){
+                var xp=XHR.prototype;
+                var nativeOpen=xp.open;
+                var nativeSend=xp.send;
+                var nativeSetHeader=xp.setRequestHeader;
+                var nativeGetHeader=xp.getResponseHeader;
+                var nativeGetAllHeaders=xp.getAllResponseHeaders;
+                var responseTextDescriptor=Object.getOwnPropertyDescriptor(xp,'responseText');
+                var responseDescriptor=Object.getOwnPropertyDescriptor(xp,'response');
+
+                function xhrRuleOnce(xhr,rule,phase,detail){
+                  xhr.__bdRuleSeen=xhr.__bdRuleSeen||Object.create(null);
+                  var key=String(rule.id||rule.name||rule.action)+'|'+phase;
+                  if(xhr.__bdRuleSeen[key])return;
+                  xhr.__bdRuleSeen[key]=true;
+                  xhr.__bdAppliedRules=xhr.__bdAppliedRules||[];
+                  remember(xhr.__bdAppliedRules,rule,xhr.__bdOriginalUrl||xhr.__bdUrl||'',phase,detail);
+                }
+                function xhrHeaderOverride(xhr,name,action){
+                  var method=String(xhr.__bdMethod||'GET').toUpperCase();
+                  var list=matchingEither(action,xhr.__bdOriginalUrl||'',xhr.__bdUrl||'',method);
+                  var wanted=String(name||'').toLowerCase();
+                  for(var i=0;i<list.length;i++){
+                    var entries=headerEntries(list[i]);
+                    for(var j=0;j<entries.length;j++){
+                      if(entries[j][0].toLowerCase()===wanted)return {rule:list[i],value:entries[j][1]};
+                    }
+                  }
+                  return null;
+                }
+                function applyXhrResponseText(xhr,text){
+                  var method=String(xhr.__bdMethod||'GET').toUpperCase();
+                  var url=xhr.__bdOriginalUrl||xhr.__bdUrl||'';
+                  var responseUrl='';
+                  try{responseUrl=xhr.responseURL||xhr.__bdUrl||'';}catch(_){}
+                  var out=String(text);
+                  matchingEither('response_body',url,responseUrl,method).forEach(function(rule){
+                    var changed=replaceText(out,rule);
+                    xhrRuleOnce(xhr,rule,'response',changed!==out?'XHR 响应内容已替换':'XHR 响应未找到替换内容');
+                    out=changed;
+                  });
+                  return out;
+                }
+
+                xp.open=function(method,url){
+                  var args=Array.prototype.slice.call(arguments);
+                  var original=absoluteUrl(url);
+                  var upper=String(method||'GET').toUpperCase();
+                  var current=original;
+                  this.__bdOriginalUrl=original;
+                  this.__bdMethod=upper;
+                  this.__bdAppliedRules=[];
+                  this.__bdRuleSeen=Object.create(null);
+                  this.__bdRuleHeadersSet=Object.create(null);
+                  matching('rewrite_url',original,upper).forEach(function(rule){
+                    var next=rewriteUrl(current,rule);
+                    if(next&&next!==current){
+                      current=next;
+                      xhrRuleOnce(this,rule,'request','XHR URL → '+next.slice(0,220));
+                    }
+                  },this);
+                  this.__bdUrl=current;
+                  try{this.__bdCrossOriginRewrite=new URL(original,location.href).origin!==new URL(current,location.href).origin;}catch(_){this.__bdCrossOriginRewrite=false;}
+                  args[1]=current;
+                  return nativeOpen.apply(this,args);
+                };
+
+                xp.setRequestHeader=function(name,value){
+                  this.__bdRuleHeadersSet=this.__bdRuleHeadersSet||Object.create(null);
+                  var override=xhrHeaderOverride(this,name,'request_headers');
+                  if(override){
+                    var key=String(name).toLowerCase();
+                    if(!this.__bdRuleHeadersSet[key]){
+                      this.__bdRuleHeadersSet[key]=true;
+                      xhrRuleOnce(this,override.rule,'request','XHR 请求 Header 已覆盖');
+                      return nativeSetHeader.call(this,name,override.value);
+                    }
+                    return;
+                  }
+                  var lowerName=String(name||'').toLowerCase();
+                  if(this.__bdCrossOriginRewrite&&(lowerName==='authorization'||lowerName==='proxy-authorization'))return;
+                  return nativeSetHeader.apply(this,arguments);
+                };
+
+                xp.send=function(body){
+                  var xhr=this;
+                  var method=String(xhr.__bdMethod||'GET').toUpperCase();
+                  var original=xhr.__bdOriginalUrl||xhr.__bdUrl||'';
+                  var start=performance.now();
+                  var terminal=firstTerminal(original,method);
+                  if(terminal&&terminal.action==='block'){
+                    xhrRuleOnce(xhr,terminal,'request','XHR 已阻止');
+                    record(original,method,0,'xhr','',0,performance.now()-start,xhr.__bdAppliedRules);
+                    try{xhr.abort();}catch(_){}
+                    setTimeout(function(){
+                      try{xhr.dispatchEvent(new ProgressEvent('error'));}catch(_){}
+                      try{xhr.dispatchEvent(new ProgressEvent('loadend'));}catch(_){}
+                    },0);
+                    return;
+                  }
+
+                  var setNames=xhr.__bdRuleHeadersSet||Object.create(null);
+                  requestHeaderRules(original,xhr.__bdUrl||original,method).forEach(function(rule){
+                    var changed=false;
+                    headerEntries(rule).forEach(function(pair){
+                      var key=pair[0].toLowerCase();
+                      if(setNames[key])return;
+                      try{nativeSetHeader.call(xhr,pair[0],pair[1]);setNames[key]=true;changed=true;}catch(_){}
+                    });
+                    if(changed)xhrRuleOnce(xhr,rule,'request','XHR 请求 Header 已注入');
+                  });
+
+                  var outboundBody=body;
+                  if(typeof body==='string'){
+                    matchingEither('request_body',original,xhr.__bdUrl||original,method).forEach(function(rule){
+                      var changed=replaceText(outboundBody,rule);
+                      xhrRuleOnce(xhr,rule,'request',changed!==outboundBody?'XHR Body 已替换':'XHR Body 未找到替换内容');
+                      outboundBody=changed;
+                    });
+                  }
+
+                  var recorded=false;
+                  function finish(){
+                    if(recorded)return;
+                    recorded=true;
+                    var responseUrl='';
+                    try{responseUrl=xhr.responseURL||xhr.__bdUrl||original;}catch(_){responseUrl=xhr.__bdUrl||original;}
+                    matchingEither('response_body',original,responseUrl,method).forEach(function(rule){
+                      if(xhr.__bdAppliedRules.indexOf(String(rule.name||rule.id||rule.action))<0)xhr.__bdAppliedRules.push(String(rule.name||rule.id||rule.action));
+                    });
+                    responseHeaderRules(original,responseUrl,method).forEach(function(rule){
+                      if(xhr.__bdAppliedRules.indexOf(String(rule.name||rule.id||rule.action))<0)xhr.__bdAppliedRules.push(String(rule.name||rule.id||rule.action));
+                    });
+                    var mime='';var bytes=0;
+                    try{mime=xhr.getResponseHeader('content-type')||'';}catch(_){}
+                    try{bytes=xhr.getResponseHeader('content-length')||0;}catch(_){}
+                    record(responseUrl,method,xhr.status,'xhr',mime,bytes,performance.now()-start,xhr.__bdAppliedRules);
+                  }
+                  xhr.addEventListener('load',finish);
+                  xhr.addEventListener('error',finish);
+                  xhr.addEventListener('abort',finish);
+                  xhr.addEventListener('timeout',finish);
+                  return nativeSend.call(xhr,outboundBody);
+                };
+
+                xp.getResponseHeader=function(name){
+                  var override=xhrHeaderOverride(this,name,'response_headers');
+                  if(override){
+                    xhrRuleOnce(this,override.rule,'response','XHR 响应 Header 已覆盖');
+                    return override.value;
+                  }
+                  return nativeGetHeader.apply(this,arguments);
+                };
+                xp.getAllResponseHeaders=function(){
+                  var base=nativeGetAllHeaders.apply(this,arguments)||'';
+                  var method=String(this.__bdMethod||'GET').toUpperCase();
+                  var responseUrl='';
+                  try{responseUrl=this.responseURL||this.__bdUrl||'';}catch(_){responseUrl=this.__bdUrl||'';}
+                  var lines=[];var names=Object.create(null);
+                  responseHeaderRules(this.__bdOriginalUrl||'',responseUrl,method).forEach(function(rule){
+                    headerEntries(rule).forEach(function(pair){
+                      var key=pair[0].toLowerCase();
+                      if(names[key])return;
+                      names[key]=true;lines.push(pair[0]+': '+pair[1]);
+                    });
+                  });
+                  return base+(lines.length?(base&&base.slice(-2)!=='\r\n'?'\r\n':'')+lines.join('\r\n')+'\r\n':'');
+                };
+
+                if(responseTextDescriptor&&responseTextDescriptor.get&&responseTextDescriptor.configurable){
+                  try{Object.defineProperty(xp,'responseText',{
+                    configurable:true,enumerable:responseTextDescriptor.enumerable,
+                    get:function(){return applyXhrResponseText(this,responseTextDescriptor.get.call(this));}
+                  });}catch(_){}
+                }
+                if(responseDescriptor&&responseDescriptor.get&&responseDescriptor.configurable){
+                  try{Object.defineProperty(xp,'response',{
+                    configurable:true,enumerable:responseDescriptor.enumerable,
+                    get:function(){
+                      var raw=responseDescriptor.get.call(this);
+                      var type=String(this.responseType||'');
+                      if((type===''||type==='text')&&typeof raw==='string')return applyXhrResponseText(this,raw);
+                      if(type==='json'&&raw!==null&&typeof raw==='object'){
+                        try{
+                          var text=JSON.stringify(raw);var changed=applyXhrResponseText(this,text);
+                          return changed===text?raw:JSON.parse(changed);
+                        }catch(_){return raw;}
+                      }
+                      return raw;
+                    }
+                  });}catch(_){}
+                }
+              }
+
+              var NativeWebSocket=window.WebSocket;
+              if(typeof NativeWebSocket==='function'){
+                var WrappedWebSocket=function(url,protocols){
+                  var original=absoluteUrl(url);
+                  var method='CONNECT';
+                  var terminal=firstTerminal(original,method);
+                  if(terminal&&terminal.action==='block'){
+                    var blocked=[];remember(blocked,terminal,original,'request','WebSocket 已阻止');
+                    record(original,method,0,'websocket','',0,0,blocked);
+                    throw new DOMException('Blocked by BrowserDiag network rule','SecurityError');
+                  }
+                  var current=original;var applied=[];
+                  matching('rewrite_url',original,method).forEach(function(rule){
+                    var next=rewriteUrl(current,rule);
+                    if(next&&next!==current){current=next;remember(applied,rule,original,'request','WebSocket URL 已重写');}
+                  });
+                  var socket=protocols===undefined?new NativeWebSocket(current):new NativeWebSocket(current,protocols);
+                  var start=performance.now();var done=false;
+                  socket.addEventListener('open',function(){if(!done){done=true;record(current,method,101,'websocket','',0,performance.now()-start,applied);}});
+                  socket.addEventListener('error',function(){if(!done){done=true;record(current,method,0,'websocket','',0,performance.now()-start,applied);}});
+                  return socket;
+                };
+                WrappedWebSocket.prototype=NativeWebSocket.prototype;
+                try{Object.setPrototypeOf(WrappedWebSocket,NativeWebSocket);}catch(_){}
+                ['CONNECTING','OPEN','CLOSING','CLOSED'].forEach(function(key){try{WrappedWebSocket[key]=NativeWebSocket[key];}catch(_){}});
+                window.WebSocket=WrappedWebSocket;
+              }
+
+              var NativeEventSource=window.EventSource;
+              if(typeof NativeEventSource==='function'){
+                var WrappedEventSource=function(url,config){
+                  var original=absoluteUrl(url);var method='GET';
+                  var terminal=firstTerminal(original,method);
+                  if(terminal&&terminal.action==='block'){
+                    var blocked=[];remember(blocked,terminal,original,'request','EventSource 已阻止');
+                    record(original,method,0,'eventsource','text/event-stream',0,0,blocked);
+                    throw new DOMException('Blocked by BrowserDiag network rule','SecurityError');
+                  }
+                  var current=original;var applied=[];
+                  matching('rewrite_url',original,method).forEach(function(rule){
+                    var next=rewriteUrl(current,rule);
+                    if(next&&next!==current){current=next;remember(applied,rule,original,'request','EventSource URL 已重写');}
+                  });
+                  var source=new NativeEventSource(current,config);
+                  var start=performance.now();var done=false;
+                  source.addEventListener('open',function(){if(!done){done=true;record(current,method,200,'eventsource','text/event-stream',0,performance.now()-start,applied);}});
+                  source.addEventListener('error',function(){if(!done){done=true;record(current,method,0,'eventsource','text/event-stream',0,performance.now()-start,applied);}});
+                  return source;
+                };
+                WrappedEventSource.prototype=NativeEventSource.prototype;
+                try{Object.setPrototypeOf(WrappedEventSource,NativeEventSource);}catch(_){}
+                window.EventSource=WrappedEventSource;
+              }
             })();
         """.trimIndent()
     }

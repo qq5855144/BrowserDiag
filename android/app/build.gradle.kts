@@ -11,8 +11,8 @@ android {
         applicationId = "com.browserdiag.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 6
-        versionName = "3.3.0"
+        versionCode = 7
+        versionName = "3.4.0"
     }
 
     buildTypes {
@@ -41,4 +41,5 @@ dependencies {
     implementation("org.nanohttpd:nanohttpd:2.3.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("com.google.zxing:core:3.5.3")
+    testImplementation("junit:junit:4.13.2")
 }

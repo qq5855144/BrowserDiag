@@ -1,9 +1,19 @@
-# BrowserDiag v3.3
+# BrowserDiag v3.4
 
 BrowserDiag 是面向 AI 与开发者的 Web 浏览器诊断工具，包含两个运行形态：
 
 1. **Node MCP 服务**（`mcp-server/`）：提供 MCP stdio、CLI 和带 Token 认证的 HTTP 模式，基于 Playwright/Chromium。
 2. **Android APK**（`android/`）：独立 WebView 浏览器，内置供 MCP / AI 工具调用的 Token HTTP Bridge（界面称「MCP 接口」），可按需开启局域网访问。
+
+## v3.4 网络实验室
+
+- 新增持久化网络规则引擎，支持优先级、URL/请求方法匹配、启停、复制、删除、命中记录与从 Network 请求一键创建规则。
+- 请求侧支持阻止、URL 重写、Header 注入、fetch/XHR 文本 Body 替换和 1-10000 ms 延迟；URL 支持通配符、`regex:` 与正则捕获组。
+- 响应侧支持 Mock 状态/Header/Body、响应 Header 重写及 HTML/JSON/JS/CSS/XML 等文本响应内容替换；原生代理有超时、大小与流式回退保护。
+- JS/CSS 可按页面 URL 在 document-start 注入；CSS 启停/编辑可在当前页热更新，JS 规则在后续导航继续以 document-start 执行。
+- fetch/XHR/WebSocket/EventSource Hook 会记录规则命中、状态、MIME、大小与耗时；Service Worker 请求也接入原生规则层，旧版 WebView 不支持 document-start 时自动降级为页面加载后 Hook。
+- 新增 MCP 调用路由 `browser_network_rules`，可远程 `list` / `hits` / `add` / `update` / `enable` / `delete` / `clear_hits`，与 App 内规则列表使用同一数据源。
+- 网络实验室不安装证书、不做 HTTPS MITM；页面/静态资源由 WebView 原生拦截层处理，fetch/XHR 的请求 Body 等 WebView 未暴露的信息由页面前置 Hook 处理。
 
 ## v3.3 浏览与诊断增强
 
@@ -43,13 +53,13 @@ BrowserDiag 是面向 AI 与开发者的 Web 浏览器诊断工具，包含两�
 
 ## Android 浏览器
 
-APK 提供多标签页、书签、历史、保存页面、分享、页面查找、翻译、二维码、TTS、媒体嗅探、资源查看、源码 ZIP、网络日志、下载管理、广告拦截、字体缩放、屏幕方向、UA/搜索引擎切换、用户脚本、深色主题、全屏、WebView 调试和可定制菜单。
+APK 提供多标签页、书签、历史、保存页面、分享、页面查找、翻译、二维码、TTS、媒体嗅探、资源查看、递归源码 ZIP、网络日志、网络实验室、下载管理、广告拦截、字体缩放、屏幕方向、UA/搜索引擎切换、用户脚本、深色主题、全屏、WebView 调试和可定制菜单。
 
 Android UI 采用 Chrome / Material 3 风格重新设计：顶部 Omnibox 集成 HTTPS 状态、加载进度与刷新/停止；底栏固定为后退、前进、主页、标签、工具 5 个全局导航入口。工具中心按「当前页面快捷操作 / 常用工具 / 页面与内容 / 浏览数据 / 诊断与开发 / 浏览设置 / BrowserDiag」组织，并提供不受快捷配置影响的全部工具入口，避免功能被隐藏后失去访问路径。标签页、书签、历史、下载、Network、Console 与诊断工具统一使用可滚动的卡片式底部面板，并为深浅色、可访问性描述与功能语义整理图标。
 
 用户脚本支持在网页中直接识别标准 `.user.js` 安装链接，也可粘贴脚本 URL 或手动创建；安装前展示名称、版本、来源、匹配/排除范围与兼容性提醒。媒体嗅探会合并 DOM 媒体、Performance 与 XHR/fetch 请求，识别视频、音频、HLS/DASH 清单并折叠媒体分片，同时提供格式、来源、大小/状态信息以及预览、下载和复制操作。
 
-Android「MCP 接口」当前通过 Token 认证的 HTTP Bridge 暴露 17 个调用路由；它是给 MCP / AI 客户端使用的桥接接口，并非原生 MCP transport：
+Android「MCP 接口」当前通过 Token 认证的 HTTP Bridge 暴露 18 个调用路由；它是给 MCP / AI 客户端使用的桥接接口，并非原生 MCP transport：
 
 | 调用路由 | 作用 |
 |---|---|
@@ -61,6 +71,7 @@ Android「MCP 接口」当前通过 Token 认证的 HTTP Bridge 暴露 17 个调
 | `browser_tabs` / `browser_interactive` | 标签和可交互元素 |
 | `browser_history` / `browser_bookmarks` | 历史与书签 |
 | `browser_http` | 带响应大小限制的 HTTP GET |
+| `browser_network_rules` | 网络实验室规则与命中记录管理 |
 
 ## 快速开始
 
