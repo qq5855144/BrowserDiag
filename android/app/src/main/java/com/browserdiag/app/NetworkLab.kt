@@ -319,7 +319,7 @@ class NetworkRuleStore(context: Context) {
                 }
             }
             if (headers.keys.none { it.equals("User-Agent", true) }) {
-                conn.setRequestProperty("User-Agent", "BrowserDiag/3.6")
+                conn.setRequestProperty("User-Agent", "BrowserDiag/3.7")
             }
             conn.setRequestProperty("Accept-Encoding", "identity")
             if (headers.keys.none { it.equals("Cookie", true) }) {

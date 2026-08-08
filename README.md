@@ -1,9 +1,18 @@
-# BrowserDiag v3.6
+# BrowserDiag v3.7
 
 BrowserDiag 是面向 AI 与开发者的 Web 浏览器诊断工具，包含两个运行形态：
 
 1. **Node MCP 服务**（`mcp-server/`）：提供 MCP stdio、CLI 和带 Token 认证的 HTTP 模式，基于 Playwright/Chromium。
 2. **Android APK**（`android/`）：独立 WebView 浏览器，内置原生 MCP Streamable HTTP 服务，并保留 Token HTTP Bridge 兼容路由，可按需开启局域网访问。
+
+## v3.7 MCP 客户端兼容与工具发现
+
+- 修复部分 AI 客户端显示“MCP 已连接”但模型看不到 `browser_*` 工具的问题：`tools/list` / `tools/call` 现在按客户端协议版本输出对应年代的最小兼容结构，不再把 2026 字段无条件混入 2024/2025 响应。
+- Streamable HTTP 继续支持根 `/` 与 `/mcp`；新增 2024-11-05 HTTP+SSE 兼容 transport：`GET /sse` 建立 SSE，`POST /messages?sessionId=...` 传送 JSON-RPC。
+- 对只允许填写一个服务器 URL 的旧客户端，根 `/` 与 `/mcp` 在收到无协议版本的 `GET + Accept: text/event-stream` 时会自动回退 legacy SSE；现代客户端仍优先通过 POST 使用 Streamable HTTP。
+- 旧协议工具定义会去掉其年代尚未定义的 `title` / structured result 等扩展字段；2026 客户端仍获得当前协议能力。
+- 开发者工具新增「MCP 工具发现诊断」，仅统计 `initialize` / `tools/list` / `tools/call`、transport、协议版本和客户端名称，不记录 Token、URL、参数或网页内容。
+- 开发者工具同时显示并可复制 Legacy SSE 地址 `http://PHONE_IP:PORT/sse`，便于手动选择 SSE transport 的 AI 客户端使用。
 
 ## v3.6 后台 MCP 保活
 
@@ -143,6 +152,14 @@ Authorization: Bearer YOUR_MCP_TOKEN
 根地址也可直接作为 MCP URL：`http://PHONE_IP:8788`。
 
 如果 AI 客户端的 MCP 面板**只能填写 URL，不能设置 Authorization Header**，请在可信局域网中额外开启「工具 → BrowserDiag → MCP URL-only 兼容」，之后直接填写 `http://PHONE_IP:8788` 即可。该模式不需要 Token，使用完成后建议关闭。
+
+如果客户端只支持旧版 SSE transport，可改用：
+
+```text
+http://PHONE_IP:8788/sse
+```
+
+若客户端显示“MCP 已连接”但模型仍声称没有 BrowserDiag 工具，请打开「工具 → 开发者工具 → MCP 工具发现诊断」：`tools/list=0` 说明客户端没有请求工具；`tools/list>0` 则说明 BrowserDiag 已返回工具，此时应在 AI 客户端重新加载 MCP Server，并新建/刷新会话以让模型重新取得工具列表。
 
 原生 MCP `initialize` 烟测示例：
 

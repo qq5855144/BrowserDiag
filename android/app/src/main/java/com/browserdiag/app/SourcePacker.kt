@@ -440,7 +440,7 @@ object SourcePacker {
         conn.instanceFollowRedirects = true
         conn.setRequestProperty(
             "User-Agent",
-            ua.ifBlank { "Mozilla/5.0 (Linux; Android) BrowserDiag/3.6" }
+            ua.ifBlank { "Mozilla/5.0 (Linux; Android) BrowserDiag/3.7" }
         )
         conn.setRequestProperty("Accept", "*/*")
         if (normalizedHttpUrl(referer) != null) conn.setRequestProperty("Referer", referer.take(4096))
